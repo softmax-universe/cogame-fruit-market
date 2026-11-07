@@ -23,7 +23,7 @@
         "/bin/fruit-market"
       ],
       "env": {},
-      "source_url": "https://github.com/Metta-AI/cogame-fruit-market/tree/main"
+      "source_url": "https://github.com/softmax-universe/cogame-fruit-market/tree/main"
     },
     "config_schema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -533,7 +533,7 @@
           "cpu": "1"
         }
       },
-      "source_url": "https://github.com/Metta-AI/cogame-fruit-market/tree/main"
+      "source_url": "https://github.com/softmax-universe/cogame-fruit-market/tree/main"
     },
     {
       "id": "fruit-market-hauler",
@@ -556,7 +556,7 @@
           "cpu": "1"
         }
       },
-      "source_url": "https://github.com/Metta-AI/cogame-fruit-market/tree/main"
+      "source_url": "https://github.com/softmax-universe/cogame-fruit-market/tree/main"
     },
     {
       "id": "fruit-market-homesteader",
@@ -579,7 +579,7 @@
           "cpu": "1"
         }
       },
-      "source_url": "https://github.com/Metta-AI/cogame-fruit-market/tree/main"
+      "source_url": "https://github.com/softmax-universe/cogame-fruit-market/tree/main"
     }
   ],
   "variants": [
