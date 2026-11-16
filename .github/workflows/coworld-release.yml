@@ -2,6 +2,7 @@
 #
 # Goes to:  .github/workflows/coworld-release.yml  in the coworld repo.
 # Substitute: fruit-market  (lowercase game slug; also the Coworld name and the
+#                      e.g. bullwhip)
 #             coworld-fruit-market (local image name WITHOUT a tag, must match compose.yaml
 #                      minus ":latest", e.g. coworld-bullwhip)
 #
@@ -12,12 +13,11 @@
 # not "upload-coworld prunes the image" -- no prune/rmi exists anywhere in the
 # CLI; only the ordering is established, so treat it as empirical.)
 #
-# Repo secrets required: SOFTMAX_TOKEN (set by coworld-builder's propagate-secrets.yml).
+# Repo secret required: SOFTMAX_TOKEN.
 #
 # The agent reads the outcome back with:
 #   gh run download <run_id> -R softmax-universe/cogame-fruit-market -n release-result \
 #     -D /tmp/rr && jq . /tmp/rr/release-result.json
-# Hosted inference uses the platform LLM sidecar without provider secrets.
 name: Coworld release
 
 on:
@@ -165,7 +165,6 @@ jobs:
           set +e
           uvx --from "$COWORLD_PKG" coworld certify dist/coworld_manifest.json \
             --no-open-report \
-            --timeout-seconds 300 \
             2>&1 | tee "$RR/certify.log"
           rc="${PIPESTATUS[0]}"
           set -e
@@ -247,6 +246,8 @@ jobs:
                   for token in argv:
                       cmd += ["--run", token]
                   for key, value in (row.get("env") or {}).items():
+                      if key == "USE_BEDROCK":
+                          continue
                       cmd += ["--secret-env", f"{key}={value}"]
                   # The command is NOT echoed: --secret-env values are policy secrets.
                   print(f"::group::upload-policy {name} ({image}) as {player or 'the token owner'}",
