@@ -20,6 +20,21 @@ const
     ## (paintball, 2026-08-25 — a dropped registration silently made a champion
     ## seat play scripted).
   RegisterResendIntervalMs = 2000
+  DefaultPrompt = """
+Earn craved-food points through funded exact-mirror trades while protecting
+hunger and stamina. Read the visible book and choose a useful standing order
+each round; do not assume hidden farmer types. Apple farmers can offer 3 apples
+for 2 bananas; banana farmers can mirror with 2 bananas for 3 apples. Stock
+your own fruit before marketing and adapt to nearby funded offers. Most
+partners rendezvous north in rounds 1-2, east 3-4, south 5-6, west 7-8, then
+repeat; join them when it helps. Prefer local harvesting and trade to costly
+routine river treks. Use hunger and stamina to choose eating or rest. Your say
+is spectator-only, so communicate through offers and position. Preserve useful
+private observations in short notes. Output one native JSON object with
+lowercase enum values and explicit job, eat, say and notes; include fruit,
+stall and offer when relevant. Keep notes under 180 characters and say under
+50. Omitted offer keeps the standing offer; null withdraws it.
+"""
 
 when isMainModule:
   let url = getEnv("COWORLD_PLAYER_WS_URL")
@@ -27,11 +42,8 @@ when isMainModule:
     quit("COWORLD_PLAYER_WS_URL is not set", 1)
   var prompt = getEnv("PLAYER_PROMPT")
   var scripted = getEnv("PLAYER_SCRIPTED").strip()
-  if prompt.len == 0 and scripted.len == 0:
-    ## A seat that sets NEITHER is `PLAYER_SCRIPTED=hauler` (design note
-    ## "Decisions"): the scripted baseline, not an unconfigured LLM seat
-    ## quietly playing a stock prompt on the operator's credentials.
-    scripted = "hauler"
+  if prompt.strip().len == 0 and scripted.len == 0:
+    prompt = DefaultPrompt
 
   proc promptFrame(): string =
     $ %*{"type": "prompt", "prompt": prompt, "scripted": scripted}
