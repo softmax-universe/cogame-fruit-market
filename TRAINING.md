@@ -77,7 +77,7 @@ Run complete local native fixtures with compiled game/player binaries:
 
 ```sh
 python3 tools/test_native_capture.py /path/to/fruit-market /path/to/fruit-market-player /new/private/output
-# Other complete cohorts: --mode invalid, --mode 429, --mode normalized, --no-capture.
+# Other complete cohorts: --mode invalid, --mode 429, --mode normalized, --mode malformed-fruit, --no-capture.
 nim c -d:release --path:src -o:/tmp/fruit-market-verify tools/verify_native_capture.nim
 /tmp/fruit-market-verify /new/private/output/config.json /new/private/output/trajectory.jsonl
 /tmp/fruit-market-verify --families

@@ -589,9 +589,11 @@ proc textOfBody*(body: string): string =
   let payload = parseJson(body)
   if payload{"stop_reason"}.getStr() == "refusal":
     raise newException(FruitMarketError, "llm refusal")
-  for contentBlock in payload{"content"}:
-    if contentBlock{"type"}.getStr() == "text":
-      result.add(contentBlock{"text"}.getStr())
+  let content = payload{"content"}
+  if not content.isNil and content.kind == JArray:
+    for contentBlock in content:
+      if contentBlock{"type"}.getStr() == "text":
+        result.add(contentBlock{"text"}.getStr())
   if payload{"stop_reason"}.getStr() == "max_tokens" and '{' notin result:
     raise newException(FruitMarketError,
       "reply cut off at max_tokens mid-JSON: " &
@@ -615,6 +617,12 @@ proc textOf(client: LlmClient, response: Response, error, url: string): string =
 # ---- the reply schema --------------------------------------------------------
 
 proc parseFruit(node: JsonNode, field: string): Fruit =
+  if node.isNil:
+    raise newException(FruitMarketError,
+      "missing fruit in " & field)
+  if node.kind != JString:
+    raise newException(FruitMarketError,
+      "unknown fruit in " & field & ": " & $node)
   case node.getStr().strip().toLowerAscii()
   of "apple": fApple
   of "banana": fBanana
@@ -622,8 +630,10 @@ proc parseFruit(node: JsonNode, field: string): Fruit =
     raise newException(FruitMarketError,
       "unknown fruit in " & field & ": " & $node)
 
-proc offerCount(node: JsonNode, config: GameConfig):
+proc offerCount(node: JsonNode, field: string, config: GameConfig):
     tuple[value: int, clamped: bool] =
+  if node.isNil:
+    raise newException(FruitMarketError, "missing " & field)
   var raw: int
   case node.kind
   of JInt:
@@ -640,6 +650,8 @@ proc offerCount(node: JsonNode, config: GameConfig):
 proc parseOrder*(payload: JsonNode, sim: Sim, slot: int): Order =
   ## Tolerant parse of one reply. Anything the table in the design note marks
   ## "invalid reply" raises; `n` outside the range is CLAMPED and flagged.
+  if payload.isNil or payload.kind != JObject:
+    raise newException(FruitMarketError, "order must be a JSON object")
   let cog = sim.cogs[slot]
   result.source = osLlm
   result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesLen)
@@ -657,13 +669,13 @@ proc parseOrder*(payload: JsonNode, sim: Sim, slot: int): Order =
     raise newException(FruitMarketError, "unknown job: " & jobNode.getStr())
 
   let fruitNode = payload{"fruit"}
-  if not fruitNode.isNil and fruitNode.kind == JString and
-      fruitNode.getStr().strip().len > 0:
-    result.fruit = parseFruit(fruitNode, "fruit")
-    result.hasFruit = true
-  else:
+  if fruitNode.isNil or fruitNode.kind == JNull or
+      (fruitNode.kind == JString and fruitNode.getStr().strip().len == 0):
     result.fruit = if result.job == jTrek: cog.craved() else: cog.farm
     result.hasFruit = false
+  else:
+    result.fruit = parseFruit(fruitNode, "fruit")
+    result.hasFruit = true
 
   let stallNode = payload{"stall"}
   if not stallNode.isNil and stallNode.kind == JString and
@@ -691,7 +703,7 @@ proc parseOrder*(payload: JsonNode, sim: Sim, slot: int): Order =
   if payload.hasKey("offer"):
     result.hasOfferKey = true
     let offerNode = payload["offer"]
-    if offerNode.kind == JNull:
+    if offerNode.isNil or offerNode.kind == JNull:
       result.withdraw = true
     else:
       if offerNode.kind != JObject or not offerNode.hasKey("give") or
@@ -701,7 +713,7 @@ proc parseOrder*(payload: JsonNode, sim: Sim, slot: int): Order =
       let
         give = offerNode["give"]
         want = offerNode["want"]
-      if give.kind != JObject or want.kind != JObject:
+      if give.isNil or want.isNil or give.kind != JObject or want.kind != JObject:
         raise newException(FruitMarketError, "offer give/want must be objects")
       let
         giveFruit = parseFruit(give{"fruit"}, "offer.give.fruit")
@@ -710,8 +722,8 @@ proc parseOrder*(payload: JsonNode, sim: Sim, slot: int): Order =
         raise newException(FruitMarketError,
           "offer give.fruit and want.fruit must differ")
       let
-        giveN = offerCount(give{"n"}, sim.config)
-        wantN = offerCount(want{"n"}, sim.config)
+        giveN = offerCount(give{"n"}, "offer.give.n", sim.config)
+        wantN = offerCount(want{"n"}, "offer.want.n", sim.config)
       result.offer = Offer(active: true,
         giveFruit: giveFruit, giveN: giveN.value,
         wantFruit: wantFruit, wantN: wantN.value)

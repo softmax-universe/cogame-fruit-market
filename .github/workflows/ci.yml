@@ -173,6 +173,17 @@ jobs:
           nim c -d:release --path:src -o:"${RUNNER_TEMP}/fruit-market-train-bridge" tools/train_bridge.nim
           python3 tools/test_train_bridge.py "${RUNNER_TEMP}/fruit-market-train-bridge"
 
+      - name: Play complete native server episodes across accepted and malformed orders
+        run: |
+          set -euo pipefail
+          nim c -d:release --path:src -o:"${RUNNER_TEMP}/fruit-market" src/fruit_market.nim
+          nim c -d:release --path:src -o:"${RUNNER_TEMP}/fruit-market-player" src/fruit_market_player.nim
+          nim c -d:release --path:src -o:"${RUNNER_TEMP}/fruit-market-verify" tools/verify_native_capture.nim
+          python3 tools/test_native_capture.py "${RUNNER_TEMP}/fruit-market" "${RUNNER_TEMP}/fruit-market-player" "${RUNNER_TEMP}/native-accepted" --mode accepted
+          "${RUNNER_TEMP}/fruit-market-verify" "${RUNNER_TEMP}/native-accepted/config.json" "${RUNNER_TEMP}/native-accepted/trajectory.jsonl"
+          python3 tools/test_native_capture.py "${RUNNER_TEMP}/fruit-market" "${RUNNER_TEMP}/fruit-market-player" "${RUNNER_TEMP}/native-malformed-fruit" --mode malformed-fruit
+          "${RUNNER_TEMP}/fruit-market-verify" "${RUNNER_TEMP}/native-malformed-fruit/config.json" "${RUNNER_TEMP}/native-malformed-fruit/trajectory.jsonl"
+
   # ---------------------------------------------------------------------
   # Packaging smoke: the production image builds, and one real episode runs
   # end to end in raw docker with the certification fixture's seat mix.
