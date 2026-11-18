@@ -187,9 +187,7 @@ suite "the CI policy set":
       check policy["name"].getStr().startsWith("fruit-market-")
       if policy["env"].hasKey("PLAYER_PROMPT"):
         prompts.inc
-        ## Without USE_BEDROCK the platform gives the player pod no Bedrock
-        ## sidecar and the seat silently plays scripted (cogolf, 2026-08-24).
-        check policy["env"]["USE_BEDROCK"].getStr() == "true"
+        check not policy["env"].hasKey("USE_BEDROCK")
         check policy["env"]["PLAYER_PROMPT"].getStr().len > 400
       else:
         scripted.inc
