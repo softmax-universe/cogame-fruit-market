@@ -290,6 +290,18 @@ def _malformed_fruit_reply(slot: int, content: str) -> bytes:
                 "notes": "null-fruit",
             }
         )
+    if round_no == 5 and slot == 0:
+        if not is_retry:
+            # 159 ASCII bytes + 3-byte em-dash crossing byte 160 without braces
+            return json.dumps(
+                {
+                    "model": "loopback-fixture",
+                    "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": ("x" * 159) + "— multibyte prose without braces"}],
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+        return wrap({"job": "harvest", "eat": "any", "say": "utf8-ok", "notes": "ok"})
     if round_no % 2 == 1:
         return wrap({"job": "harvest", "eat": "any", "say": f"r{round_no}", "notes": "ok"})
     return wrap(
@@ -490,12 +502,13 @@ def main() -> None:
         )
         return
     assert trajectory.is_file(), "Complete native game did not retain its private trajectory"
-    events = [json.loads(line) for line in trajectory.read_text().splitlines()]
+    trajectory_raw = trajectory.read_bytes()
+    events = [json.loads(line) for line in trajectory_raw.decode("utf-8").splitlines()]
     assert events[-1]["event_type"] == "episode" and events[-1]["status"] == "completed"
     decisions = events[:-1]
     assert len(decisions) == 96
     actual = [a for d in decisions for a in d["attempts"] if a["origin"] == "model"]
-    expected_calls = 29 if args.mode == "malformed-fruit" else 24 if args.mode in ("accepted", "normalized") else 48
+    expected_calls = 30 if args.mode == "malformed-fruit" else 24 if args.mode in ("accepted", "normalized") else 48
     assert len(actual) == len(calls) == expected_calls, (len(actual), len(calls), expected_calls)
     received = {c["id"]: c for c in calls}
     for attempt in actual:
@@ -542,6 +555,11 @@ def main() -> None:
         assert r4s1["action_status"] == "rejected"
         assert r4s1["selected_attempt_id"] is None
         assert "fruit" not in r4s1["executed_action"]
+        # Round 5 seat 0: multibyte UTF-8 crossing byte 160 rejected cleanly with valid UTF-8 trajectory
+        r5s0 = by_round_seat[(5, 0)]
+        assert r5s0["action_status"] == "accepted"
+        assert r5s0["selected_attempt_id"].endswith("-1")
+        assert "no JSON object in response:" in r5s0["attempts"][0]["rejection_reason"]
         # Seat 2 (external player): all 12 rounds accepted valid external orders after rejecting malformed frames
         for r in range(1, 13):
             d_ext = by_round_seat[(r, 2)]
