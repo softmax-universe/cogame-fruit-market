@@ -16,7 +16,7 @@
 ## and deterministic.
 
 import
-  std/[json, os, strutils, times],
+  std/[json, os, strutils, times, unicode],
   bitworld/runtime,
   curly,
   ./sim_types, ./sim_config, ./board, ./sim_state, ./sim, ./scripted, ./prompts,
@@ -539,6 +539,11 @@ proc userPrompt*(sim: Sim, slot: int, prompt: string): string =
 
 # ---- transport ---------------------------------------------------------------
 
+proc utf8Snippet(text: string, limit: int): string =
+  let bad = text.validateUtf8()
+  let valid = if bad >= 0: text[0 ..< bad] else: text
+  cleanText(valid, limit)
+
 proc extractJsonObject*(text: string): JsonNode =
   ## Pulls the first {...} object out of a model response, tolerating fences
   ## and trailing prose.
@@ -546,11 +551,8 @@ proc extractJsonObject*(text: string): JsonNode =
     start = text.find('{')
     stop = text.rfind('}')
   if start < 0 or stop <= start:
-    var head = text.strip()
-    if head.len > 160:
-      head = head[0 ..< 160] & "..."
     raise newException(FruitMarketError,
-      "no JSON object in response: " & head.replace("\n", " "))
+      "no JSON object in response: " & utf8Snippet(text, 160))
   parseJson(text[start .. stop])
 
 proc requestFor(client: LlmClient, system, user: string, slot: int):
@@ -596,8 +598,7 @@ proc textOfBody*(body: string): string =
         result.add(contentBlock{"text"}.getStr())
   if payload{"stop_reason"}.getStr() == "max_tokens" and '{' notin result:
     raise newException(FruitMarketError,
-      "reply cut off at max_tokens mid-JSON: " &
-      result[0 .. min(result.high, 160)].replace("\n", " "))
+      "reply cut off at max_tokens mid-JSON: " & utf8Snippet(result, 160))
 
 proc textOf(client: LlmClient, response: Response, error, url: string): string =
   if error.len > 0:
@@ -605,13 +606,13 @@ proc textOf(client: LlmClient, response: Response, error, url: string): string =
   if response.code == 401 or response.code == 403:
     client.disabled = true
     raise newException(FruitMarketError, "llm auth failed (" & $response.code &
-      "): " & response.body[0 .. min(response.body.high, 300)])
+      "): " & utf8Snippet(response.body, 300))
   if response.code == 429:
     raise newException(FruitMarketError, "llm throttled (429): " &
-      response.body[0 .. min(response.body.high, 200)])
+      utf8Snippet(response.body, 200))
   if response.code < 200 or response.code >= 300:
     raise newException(FruitMarketError, "llm error " & $response.code & ": " &
-      response.body[0 .. min(response.body.high, 200)])
+      utf8Snippet(response.body, 200))
   textOfBody(response.body)
 
 # ---- the reply schema --------------------------------------------------------
@@ -806,9 +807,10 @@ proc decideAll*(
             evidence.rejectionReason = some("native parser normalized proposal")
         result[slot] = order
       except CatchableError as error:
-        if capture != nil: evidence.rejectionReason = some(error.msg)
+        let reason = utf8Snippet(error.msg, MaxErrorLen)
+        if capture != nil: evidence.rejectionReason = some(reason)
         echo "fruit-market llm: seat ", slot, " attempt ", attempt,
-          " failed: ", cleanText(error.msg, MaxErrorLen)
+          " failed: ", reason
         stillOpen.add(slot)
       if capture != nil:
         capture.recordAttempt(slot, evidence, selection.promptMetadata(
