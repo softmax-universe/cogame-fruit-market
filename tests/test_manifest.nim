@@ -179,22 +179,18 @@ suite "the CI policy set":
   let policies = parseJson(readFile(RepoRoot / "tools" / "ci" / "policies.json"))
 
   test "two prompt champions and two scripted fillers, all one image":
-    check policies.len == 4
-    var prompts = 0
-    var scripted = 0
+    var names: seq[string]
     for policy in policies:
+      names.add(policy["name"].getStr())
       check policy["run"].getStr() == "/bin/fruit-market-player"
-      check policy["name"].getStr().startsWith("fruit-market-")
-      if policy["env"].hasKey("PLAYER_PROMPT"):
-        prompts.inc
-        check not policy["env"].hasKey("USE_BEDROCK")
+      check policy["env"].len == 1
+      if names.len <= 2:
         check policy["env"]["PLAYER_PROMPT"].getStr().len > 400
       else:
-        scripted.inc
-        check policy["env"]["PLAYER_SCRIPTED"].getStr() in
-          ["hauler", "homesteader"]
-    check prompts == 2
-    check scripted == 2
+        check policy["env"]["PLAYER_SCRIPTED"].getStr() ==
+          ["hauler", "homesteader"][names.len - 3]
+    check names == @["fruit-market-broker", "fruit-market-ricardo",
+      "fruit-market-hauler", "fruit-market-homesteader"]
 
   test "champion #2 is uploaded as daveey-1":
     check policies[1]["name"].getStr() == "fruit-market-ricardo"
