@@ -207,10 +207,9 @@ suite "degrade, never hang":
       connected[slot] = true
     let orders = client.decideAll(game, prompts, scripts, connected, PromptSelection())
     for slot in 0 ..< Seats:
-      check orders[slot].job in {jHarvest, jMarket, jTrek, jRest}
-      check orders[slot] == scriptedOrder(game, slot, skHauler)
+      check orders[slot] == Order(job: jRest, eat: epNone, source: osFallback)
 
-  test "a seat that never connected plays hauler for the whole episode":
+  test "a seat that never connected holds rest fallback rather than playing hauler":
     var game = bench()
     var config = game.config
     let client = newLlmClient(config)
@@ -222,7 +221,7 @@ suite "degrade, never hang":
       scripts[slot] = skNone
       connected[slot] = slot != 3
     let orders = client.decideAll(game, prompts, scripts, connected, PromptSelection())
-    check orders[3] == scriptedOrder(game, 3, skHauler)
+    check orders[3] == Order(job: jRest, eat: epNone, source: osFallback)
 
   test "a scripted registration is honoured without a request":
     var game = bench()
@@ -263,11 +262,7 @@ suite "a stubbed transport degrades to the scripted order":
     let game = bench()
     let orders = runAgainstStub(smJunk)
     for slot in 0 ..< Seats:
-      check orders[slot].source == osFallback
-      check orders[slot].job in {jHarvest, jMarket, jTrek, jRest}
-      var want = scriptedOrder(game, slot, skHauler)
-      want.source = osFallback
-      check orders[slot] == want
+      check orders[slot] == Order(job: jRest, eat: epNone, source: osFallback)
 
   test "a 429 falls back and leaves the client enabled for the next round":
     startStub(smThrottle)

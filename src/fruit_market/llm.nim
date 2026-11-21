@@ -770,9 +770,10 @@ proc decideAll*(
   var open: seq[int]
   for slot in 0 ..< Seats:
     let kind = scripted[slot]
-    if kind != skNone or client.disabled or not connected[slot]:
-      result[slot] = scriptedOrder(sim, slot,
-        (if kind == skNone: skHauler else: kind))
+    if kind != skNone:
+      result[slot] = scriptedOrder(sim, slot, kind)
+    elif client.disabled or not connected[slot]:
+      result[slot] = Order(job: jRest, eat: epNone, source: osFallback)
     else:
       open.add(slot)
 
@@ -819,6 +820,5 @@ proc decideAll*(
     open = stillOpen
 
   for slot in open:
-    echo "fruit-market llm: seat ", slot, " falling back to scripted order"
-    result[slot] = scriptedOrder(sim, slot, skHauler)
-    result[slot].source = osFallback
+    echo "fruit-market llm: seat ", slot, " falling back to rest order"
+    result[slot] = Order(job: jRest, eat: epNone, source: osFallback)
