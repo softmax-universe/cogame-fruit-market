@@ -329,7 +329,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
                 cause: "player_disconnected",
                 detail: "external seat " & $slot & " disconnected"
               ))
-            else:
+            elif batchResult.ok:
               failures.add(SeatFailure(
                 slot: slot,
                 kind: dfkInfrastructure,

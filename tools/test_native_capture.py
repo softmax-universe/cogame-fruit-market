@@ -344,6 +344,7 @@ def main() -> None:
         choices=(
             "accepted",
             "invalid",
+            "mixed-invalid",
             "ambiguous",
             "429",
             "no-credentials",
@@ -398,7 +399,7 @@ def main() -> None:
                         "say": "fixture",
                         "notes": "local",
                     }
-                    if args.mode == "invalid":
+                    if args.mode in ("invalid", "mixed-invalid"):
                         order["job"] = "not-a-native-job"
                     elif args.mode == "normalized":
                         order["notes"] = "local\rnormalized"
@@ -496,11 +497,11 @@ def main() -> None:
                 assert time.monotonic() < deadline, "Game never became healthy"
                 time.sleep(0.05)
         for seat in range(8):
-            if args.mode in ("malformed-fruit", "external-timeout") and seat == 2:
+            if args.mode in ("malformed-fruit", "external-timeout", "mixed-invalid") and seat == 2:
                 external_thread = threading.Thread(
                     target=_run_external_malformed_then_valid_seat,
                     args=("127.0.0.1", port, 2, "token-2", external_summary),
-                    kwargs={"drop_round": 1 if args.mode == "external-timeout" else None},
+                    kwargs={"drop_round": 1 if args.mode in ("external-timeout", "mixed-invalid") else None},
                 )
                 external_thread.start()
                 continue
@@ -520,7 +521,7 @@ def main() -> None:
                     stderr=subprocess.STDOUT,
                 )
             )
-        expect_failure = args.mode in ("invalid", "ambiguous", "429", "no-credentials", "external-timeout")
+        expect_failure = args.mode in ("invalid", "mixed-invalid", "ambiguous", "429", "no-credentials", "external-timeout")
         game_rc = game.wait(timeout=60)
         if expect_failure:
             assert game_rc != 0, f"expected non-zero exit for mode={args.mode}, got {game_rc}"
@@ -548,7 +549,7 @@ def main() -> None:
         failure = json.loads((output / "player_failure.json").read_text())
         assert failure["reason"] == "failed", failure
         assert "scores" not in failure and "win" not in failure, failure
-        if args.mode in ("invalid", "ambiguous"):
+        if args.mode in ("invalid", "mixed-invalid", "ambiguous"):
             assert failure["failure_category"] == "model_invalid", failure
             assert failure["failure_cause"] == "model_invalid_action", failure
             expected_action_status = "rejected"
