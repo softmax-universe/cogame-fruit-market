@@ -221,6 +221,26 @@ proc overJson*(results: JsonNode, names, policyNames: array[Seats, string],
     farmTypes: array[Seats, Fruit]): JsonNode =
   ## The end-card is STATE, not an event: present on every game-over frame so a
   ## viewer who seeks straight to the end still sees the verdict.
+  let ending = results{"ending"}.getStr("round_limit")
+  if results{"reason"}.getStr() == "failed":
+    return %*{
+      "winner": "",
+      "draw": false,
+      "timeLimit": false,
+      "failed": true,
+      "teams": newJObject(),
+      "endingKey": ending,
+      "ending": "FAILED",
+      "failureCategory": results{"failure_category"}.getStr(),
+      "failureCause": results{"failure_cause"}.getStr(),
+      "failureDetail": results{"failure_detail"}.getStr(),
+      "scores": newJArray(),
+      "aliases": (block:
+        var arr = newJArray()
+        for slot in 0 ..< Seats:
+          arr.add(%names[slot])
+        arr)
+    }
   var
     best = -1
     bestSlot = 0
@@ -246,7 +266,6 @@ proc overJson*(results: JsonNode, names, policyNames: array[Seats, string],
       total += (if scores.isNil or slot >= scores.len: 0
                 else: scores[slot].getInt())
     teams[guildOf(fruit)] = %*{"lives": total, "prog": 0}
-  let ending = results{"ending"}.getStr("round_limit")
   %*{
     "winner": guildOf(farmTypes[bestSlot]),
     "draw": winners.len > 1,
@@ -257,7 +276,6 @@ proc overJson*(results: JsonNode, names, policyNames: array[Seats, string],
       case ending
       of "famine": "FAMINE"
       of "deadline": "TIME"
-      of "forfeit": "FORFEIT"
       else: "ROUND LIMIT"),
     "winnerAlias": names[bestSlot],
     "winnerPolicy": policyNames[bestSlot],

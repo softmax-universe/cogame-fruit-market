@@ -1,10 +1,9 @@
 ## The two scripted baselines, both fieldable, both league fillers.
 ##
-## `hauler` is the working baseline, the league's first filler, and the
-## fallback every failed LLM decision lands on. `homesteader` is the autarky
-## foil and the reason the rivers exist. A test-only `mirror` kernel reads the
-## book; it lives here for gate (d) of the feasibility oracle and is NOT a
-## shipped policy.
+## `hauler` is the working baseline and the league's first filler.
+## `homesteader` is the autarky foil and the reason the rivers exist. A
+## test-only `mirror` kernel reads the book; it lives here for gate (d) of the
+## feasibility oracle and is NOT a shipped policy.
 ##
 ## Every field either baseline emits is inside its declared enum by
 ## construction, and every offer it posts is funded at the moment of posting —

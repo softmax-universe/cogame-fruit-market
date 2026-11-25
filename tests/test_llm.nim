@@ -12,7 +12,8 @@ import curly
 import fruit_market/prompts, fruit_market/sim, fruit_market/scripted, fruit_market/llm
 
 type StubMode = enum
-  smJunk        ## 200 with prose and no JSON object
+  smJunk        ## 200 Messages envelope whose model text is prose with no JSON object
+  smBadEnvelope ## 200 non-JSON HTTP body (malformed provider envelope)
   smThrottle    ## 429
   smForbidden   ## 403
   smSilent      ## answers so late the client's own deadline fires first
@@ -39,7 +40,8 @@ proc stubAccept() =
           break
       let body =
         case stubMode
-        of smJunk: """I think I will go to the market, but I will not say so in JSON."""
+        of smJunk: """{"stop_reason":"end_turn","content":[{"type":"text","text":"I think I will go to the market, but I will not say so in JSON."}]}"""
+        of smBadEnvelope: """not valid json at all"""
         of smThrottle: """{"type":"error","error":{"type":"overloaded"}}"""
         of smForbidden: """{"type":"error","error":{"type":"forbidden"}}"""
         of smSilent: """{"content":[{"type":"text","text":"{}"}]}"""
@@ -109,20 +111,59 @@ proc parse(sim: Sim, text: string, slot = 0): Order =
 
 suite "extracting the object":
   let sim = bench()
-  test "a fenced reply":
-    let order = sim.parse("""Sure!
-```json
-{"job": "market", "stall": "north", "eat": "crave"}
-```
-""")
+  test "a bare JSON object":
+    let order = sim.parse("""{"job": "market", "stall": "north", "eat": "crave"}""")
     check order.job == jMarket
     check order.stall == stNorth
     check order.eat == epCrave
 
-  test "a prose-prefixed reply with trailing prose":
-    let order = sim.parse(
-      "I will go and harvest. {\"job\":\"harvest\"} Hope that helps.")
-    check order.job == jHarvest
+  test "a single JSON-tagged or plain outer Markdown code fence":
+    let tagged = sim.parse("""```json
+{"job": "market", "stall": "north", "eat": "crave"}
+```""")
+    check tagged.job == jMarket
+    check tagged.stall == stNorth
+    check tagged.eat == epCrave
+
+    let plain = sim.parse("""```
+{"job": "harvest", "eat": "any"}
+```""")
+    check plain.job == jHarvest
+    check plain.eat == epAny
+
+  test "surrounding prose around bare or fenced JSON is rejected":
+    expect FruitMarketError:
+      discard sim.parse("""Sure!
+```json
+{"job": "market", "stall": "north", "eat": "crave"}
+```
+""")
+    expect FruitMarketError:
+      discard sim.parse(
+        "I will go and harvest. {\"job\":\"harvest\"} Hope that helps.")
+    expect FruitMarketError:
+      discard sim.parse("""```json
+{"job": "rest"}
+```
+Done.""")
+
+  test "extra objects and non-JSON code fences are rejected":
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"rest"}{"job":"harvest"}""")
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"rest"}
+{"job":"harvest"}""")
+    expect FruitMarketError:
+      discard sim.parse("""```json
+{"job":"rest"}
+```
+```json
+{"job":"harvest"}
+```""")
+    expect FruitMarketError:
+      discard sim.parse("""```python
+{"job":"rest"}
+```""")
 
   test "no object at all is an error that quotes the head of the reply":
     expect FruitMarketError:
@@ -146,15 +187,43 @@ suite "the reply schema":
     expect FruitMarketError:
       discard sim.parse("""{"job":"rest","eat":"sometimes"}""")
 
+  test "uppercase, padded, empty, and wrong-type fields are rejected":
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"  HARVEST  "}""")
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"harvest","fruit":""}""")
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"market","stall":123}""")
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"market","stall":""}""")
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"rest","eat":123}""")
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"rest","eat":""}""")
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"rest","say":123}""")
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"rest","notes":["a"]}""")
+
+  test "unknown fields and legacy aliases are rejected":
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"rest","action":"harvest"}""")
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"market","offer":
+        {"give":{"fruit":"apple","n":3,"extra":1},"want":{"fruit":"banana","n":2}}}""")
+
   test "give.fruit == want.fruit is invalid":
     expect FruitMarketError:
       discard sim.parse("""{"job":"market","offer":
         {"give":{"fruit":"apple","n":3},"want":{"fruit":"apple","n":2}}}""")
 
-  test "a non-integer n is invalid":
+  test "a non-integer n (including numeric strings) is invalid":
     expect FruitMarketError:
       discard sim.parse("""{"job":"market","offer":
         {"give":{"fruit":"apple","n":"three"},"want":{"fruit":"banana","n":2}}}""")
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"market","offer":
+        {"give":{"fruit":"apple","n":"3"},"want":{"fruit":"banana","n":2}}}""")
 
   test "n = 9 is clamped to 6 and flagged":
     let order = sim.parse("""{"job":"market","offer":
@@ -192,8 +261,8 @@ suite "the reply schema":
     check game.cogs[0].offer.active
     check game.cogs[0].offer.giveN == 3
 
-suite "degrade, never hang":
-  test "with no credentials every seat plays hauler and nothing raises":
+suite "fail explicitly, never substitute fake moves":
+  test "with no credentials every prompt seat fails with missing_credentials":
     var game = bench()
     var config = game.config
     let client = newLlmClient(config)
@@ -205,11 +274,16 @@ suite "degrade, never hang":
       prompts[slot] = "trade well"
       scripts[slot] = skNone
       connected[slot] = true
-    let orders = client.decideAll(game, prompts, scripts, connected, PromptSelection())
+    let res = client.decideAll(game, prompts, scripts, connected, PromptSelection())
+    check not res.ok
+    check res.failures.len == Seats
     for slot in 0 ..< Seats:
-      check orders[slot] == Order(job: jRest, eat: epNone, source: osFallback)
+      check not res.decided[slot]
+      check res.failures[slot].slot == slot
+      check res.failures[slot].kind == dfkInfrastructure
+      check res.failures[slot].cause == "missing_credentials"
 
-  test "a seat that never connected holds rest fallback rather than playing hauler":
+  test "a seat that never connected fails with player_disconnected":
     var game = bench()
     var config = game.config
     let client = newLlmClient(config)
@@ -218,10 +292,15 @@ suite "degrade, never hang":
     var scripts: array[Seats, ScriptKind]
     var connected: array[Seats, bool]
     for slot in 0 ..< Seats:
-      scripts[slot] = skNone
+      scripts[slot] = if slot == 3: skNone else: skHauler
       connected[slot] = slot != 3
-    let orders = client.decideAll(game, prompts, scripts, connected, PromptSelection())
-    check orders[3] == Order(job: jRest, eat: epNone, source: osFallback)
+    let res = client.decideAll(game, prompts, scripts, connected, PromptSelection())
+    check not res.ok
+    check res.failures.len == 1
+    check res.failures[0].slot == 3
+    check res.failures[0].kind == dfkInfrastructure
+    check res.failures[0].cause == "player_disconnected"
+    check not res.decided[3]
 
   test "a scripted registration is honoured without a request":
     var game = bench()
@@ -234,17 +313,33 @@ suite "degrade, never hang":
     for slot in 0 ..< Seats:
       connected[slot] = true
       scripts[slot] = if slot < 4: skHauler else: skHomesteader
-    let orders = client.decideAll(game, prompts, scripts, connected, PromptSelection())
+    let res = client.decideAll(game, prompts, scripts, connected, PromptSelection())
+    check res.ok
     for slot in 0 ..< Seats:
       let want = if slot < 4: skHauler else: skHomesteader
-      check orders[slot] == scriptedOrder(game, slot, want)
+      check res.decided[slot]
+      check res.orders[slot] == scriptedOrder(game, slot, want)
 
-suite "a stubbed transport degrades to the scripted order":
+  test "failEpisode produces unscored failure JSON with no scores or winners":
+    var game = bench()
+    game.failEpisode("infrastructure", "provider_rate_limit",
+      "llm throttled (429)", @[0, 1])
+    check game.done
+    check game.failed
+    let payload = game.resultsJson()
+    check payload["reason"].getStr() == "failed"
+    check payload["ending"].getStr() == "provider_rate_limit"
+    check payload["failure_category"].getStr() == "infrastructure"
+    check payload["failure_cause"].getStr() == "provider_rate_limit"
+    check not payload.hasKey("scores")
+    check not payload.hasKey("win")
+
+suite "a stubbed transport fails explicitly with classified causes":
   ## Every one of these routes a REAL request through curly to the stub and
-  ## asserts the seat still gets a legal hauler order marked `fallback` — the
-  ## record phase 60 counts. Nothing raises out of `decideAll`, ever.
+  ## asserts the seat fails with an explicit classified cause (infrastructure vs
+  ## model_invalid) and NEVER substitutes a passive rest or scripted order.
   proc runAgainstStub(mode: StubMode, openSeats = Seats,
-      timeoutSeconds = 1): array[Seats, Order] =
+      timeoutSeconds = 1): DecisionBatchResult =
     startStub(mode)
     let client = stubClient(timeoutSeconds)
     check not client.disabled          ## the stub IS a credentialed transport
@@ -258,13 +353,27 @@ suite "a stubbed transport degrades to the scripted order":
       connected[slot] = true
     client.decideAll(game, prompts, scripts, connected, PromptSelection())
 
-  test "junk with no JSON object falls back and is recorded as fallback":
-    let game = bench()
-    let orders = runAgainstStub(smJunk)
-    for slot in 0 ..< Seats:
-      check orders[slot] == Order(job: jRest, eat: epNone, source: osFallback)
+  test "junk with no JSON object fails as model_invalid":
+    let res = runAgainstStub(smJunk)
+    check not res.ok
+    check res.failures.len == Seats
+    for i, failure in res.failures:
+      check failure.slot == i
+      check failure.kind == dfkModelInvalid
+      check failure.cause == "model_invalid_action"
+      check not res.decided[i]
 
-  test "a 429 falls back and leaves the client enabled for the next round":
+  test "a malformed non-JSON HTTP 200 envelope fails as infrastructure provider_invalid_response":
+    let res = runAgainstStub(smBadEnvelope)
+    check not res.ok
+    check res.failures.len == Seats
+    for i, failure in res.failures:
+      check failure.slot == i
+      check failure.kind == dfkInfrastructure
+      check failure.cause == "provider_invalid_response"
+      check not res.decided[i]
+
+  test "a 429 fails as infrastructure provider_rate_limit and leaves client enabled":
     startStub(smThrottle)
     let client = stubClient()
     var game = bench()
@@ -274,13 +383,16 @@ suite "a stubbed transport degrades to the scripted order":
     for slot in 0 ..< Seats:
       scripts[slot] = skNone
       connected[slot] = true
-    let orders = client.decideAll(game, prompts, scripts, connected, PromptSelection())
-    for slot in 0 ..< Seats:
-      check orders[slot].source == osFallback
-    ## 429 is a throttle, not an auth failure: the seat is retried next round.
+    let res = client.decideAll(game, prompts, scripts, connected, PromptSelection())
+    check not res.ok
+    check res.failures.len == Seats
+    for failure in res.failures:
+      check failure.kind == dfkInfrastructure
+      check failure.cause == "provider_rate_limit"
+    ## 429 is a throttle, not an auth failure: client stays enabled.
     check not client.disabled
 
-  test "a 403 falls back and disables the client for the rest of the episode":
+  test "a 403 fails as infrastructure provider_auth_error and disables the client":
     startStub(smForbidden)
     let client = stubClient()
     var game = bench()
@@ -290,18 +402,27 @@ suite "a stubbed transport degrades to the scripted order":
     for slot in 0 ..< Seats:
       scripts[slot] = skNone
       connected[slot] = true
-    let orders = client.decideAll(game, prompts, scripts, connected, PromptSelection())
-    for slot in 0 ..< Seats:
-      check orders[slot].source == osFallback
+    let res = client.decideAll(game, prompts, scripts, connected, PromptSelection())
+    check not res.ok
+    check res.failures.len == Seats
+    for failure in res.failures:
+      check failure.kind == dfkInfrastructure
+      check failure.cause == "provider_auth_error"
     check client.disabled
 
-  test "a transport that outlasts llmTimeoutSeconds falls back, bounded":
+  test "a transport that outlasts llmTimeoutSeconds fails as infrastructure, bounded":
     ## One open seat, so the wall clock is two attempts of the 1 s deadline.
     let started = epochTime()
-    let orders = runAgainstStub(smSilent, openSeats = 1)
+    let res = runAgainstStub(smSilent, openSeats = 1)
     let elapsed = epochTime() - started
-    check orders[0].source == osFallback
-    check orders[1].source == osScripted
+    check not res.ok
+    check res.failures.len == 1
+    check res.failures[0].slot == 0
+    check res.failures[0].kind == dfkInfrastructure
+    check res.failures[0].cause in ["provider_timeout", "provider_transport_error"]
+    check not res.decided[0]
+    check res.decided[1]
+    check res.orders[1].source == osScripted
     check elapsed < 20.0
 
 suite "the batch and the pacing floor":

@@ -53,16 +53,19 @@ proc restOrder(fruit: Fruit): Order =
   Order(job: jRest, fruit: fruit, eat: epNone, source: osScripted)
 
 suite "PLAYER_SCRIPTED":
-  test "only the two shipped baselines are selectable; mirror is not":
+  test "only the two shipped baselines are selectable; aliases and unknown values are rejected":
     ## `mirror` is gate (d)'s book reader and lives in tests/test_feasibility.
-    ## It is not a shipped policy, so the production image must not field it
-    ## for a seat that asks for it by name.
+    ## It is not a shipped policy, and legacy aliases / unknown names must raise
+    ## rather than silently substituting `hauler`.
     check parseScriptKind("") == skNone
     check parseScriptKind("hauler") == skHauler
     check parseScriptKind("HOMESTEADER") == skHomesteader
-    check parseScriptKind("autarky") == skHomesteader
-    check parseScriptKind("mirror") == skHauler
-    check parseScriptKind("whatever") == skHauler
+    expect FruitMarketError:
+      discard parseScriptKind("autarky")
+    expect FruitMarketError:
+      discard parseScriptKind("mirror")
+    expect FruitMarketError:
+      discard parseScriptKind("whatever")
 
 suite "harvest":
   test "3 of your own fruit, 1 of the other, with the right cooldown":

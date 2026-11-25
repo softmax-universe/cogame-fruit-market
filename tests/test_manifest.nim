@@ -64,12 +64,15 @@ suite "the manifest template":
     check game.hasKey("owner")
     check fileExists(RepoRoot / "tools" / "build_replay_viewer.sh")
 
-  test "hosted inference needs no provider secret":
+  test "hosted inference needs no provider secret and enables server-side LLM":
     check game["name"].getStr() == "fruit-market"
     doAssert game{"runnable"}{"env"}{"ANTHROPIC_API_KEY_URI"}.isNil,
       "hosted LLM uses the platform sidecar without provider secrets"
     check game["runnable"]["type"].getStr() == "game"
     check game["runnable"]["run"][0].getStr() == "/bin/fruit-market"
+    check game["runnable"]["env"]["COWORLD_LLM_ENABLED"].getStr() == "true"
+    check game["runnable"]["env"]["COWORLD_LLM_MODEL"].getStr() ==
+      "anthropic/claude-haiku-4.5"
 
   test "docs are text objects with a readme and non-empty pages":
     check game["docs"]["readme"]["type"].getStr() == "text"
@@ -91,6 +94,11 @@ suite "the manifest template":
   test "every declared player entry is seated at least once":
     ## `players-run` seats the whole roster; a baseline x N fixture fails
     ## players_missing (raid, 2026-08-23).
+    check manifest["player"][0]["id"].getStr() == "fruit-market-player"
+    check manifest["player"][0]["env"]["COWORLD_LLM_ENABLED"].getStr() == "true"
+    check manifest["player"][0]["env"]["COWORLD_LLM_MODEL"].getStr() ==
+      "anthropic/claude-haiku-4.5"
+    check not manifest["player"][0]["env"].hasKey("PLAYER_SCRIPTED")
     var declared = initHashSet[string]()
     for player in manifest["player"]:
       declared.incl(player["id"].getStr())

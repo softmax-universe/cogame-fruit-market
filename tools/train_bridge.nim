@@ -205,7 +205,9 @@ when isMainModule:
       response = %*{"response": $(if textMode: orderJson(order) else: action)}
     of "step":
       doAssert not game.done and request["decision_id"].getInt() == id
-      let action = parseJson(request["response"].getStr())
+      let action =
+        if textMode: extractJsonObject(request["response"].getStr())
+        else: parseJson(request["response"].getStr())
       var payload = action
       if not textMode:
         payload = %*{"job": action["job"], "eat": action["eat"]}

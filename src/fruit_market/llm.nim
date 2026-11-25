@@ -7,13 +7,14 @@
 ## Decisions within a round are SIMULTANEOUS by rule, so all eight seats'
 ## requests go out as ONE parallel batch (`curly.makeRequests`) — never
 ## sequentially and never one seat at a time. An invalid reply is retried once,
-## in the same round's retry batch, with a hint; anything still failing falls
-## back to the `hauler` order and is recorded `"source":"fallback"`.
+## in the same round's retry batch, with a hint; anything still failing returns
+## an explicit seat failure so the server closes the unfinished episode unscored
+## rather than substituting a fake move.
 ##
 ## Credentials, in order: Bedrock sidecar -> ANTHROPIC_API_KEY ->
 ## ANTHROPIC_API_KEY_URI. With none the client disables itself immediately and
-## every seat plays `hauler`, which is what keeps offline certification green
-## and deterministic.
+## any prompt seat fails with `missing_credentials` (scripted seats still run
+## their configured baseline).
 
 import
   std/[json, os, strutils, times, unicode],
@@ -32,6 +33,28 @@ const
     "eat values, and offer quantities between 1 and 6."
 
 type
+  LlmInfraError* = object of FruitMarketError
+    cause*: string
+
+  LlmModelError* = object of FruitMarketError
+    cause*: string
+
+  DecisionFailureKind* = enum
+    dfkNone
+    dfkInfrastructure
+    dfkModelInvalid
+
+  SeatFailure* = object
+    slot*: int
+    kind*: DecisionFailureKind
+    cause*: string
+    detail*: string
+
+  DecisionBatchResult* = object
+    orders*: array[Seats, Order]
+    decided*: array[Seats, bool]
+    failures*: seq[SeatFailure]
+
   LlmTransport = enum
     ltNone, ltSidecar, ltBedrock, ltAnthropic
 
@@ -48,6 +71,15 @@ type
     maxOutputTokens: int
     timeoutSeconds: int
     disabled*: bool
+
+proc ok*(res: DecisionBatchResult): bool =
+  res.failures.len == 0
+
+proc categoryName*(kind: DecisionFailureKind): string =
+  case kind
+  of dfkNone: ""
+  of dfkInfrastructure: "infrastructure"
+  of dfkModelInvalid: "model_invalid"
 
 proc bedrockModelIds(): seq[string] =
   ## HAIKU ONLY (raid 2026-08-23, reconfirmed paintball 2026-08-25): the sonnet
@@ -112,7 +144,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "fruit-market llm: no LLM credentials; every seat plays hauler"
+    echo "fruit-market llm: no LLM credentials; prompt seats will fail without fallback"
 
 # ---- the observation --------------------------------------------------------
 
@@ -545,15 +577,43 @@ proc utf8Snippet(text: string, limit: int): string =
   cleanText(valid, limit)
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first {...} object out of a model response, tolerating fences
-  ## and trailing prose.
-  let
-    start = text.find('{')
-    stop = text.rfind('}')
-  if start < 0 or stop <= start:
+  ## Parses exactly one JSON object: either bare or inside a single ordinary
+  ## outer Markdown code fence (plain ``` or ```json). Rejects surrounding
+  ## prose, extra objects, and non-JSON fence tags.
+  let trimmed = text.strip()
+  if trimmed.len == 0:
     raise newException(FruitMarketError,
       "no JSON object in response: " & utf8Snippet(text, 160))
-  parseJson(text[start .. stop])
+  var candidate = trimmed
+  if trimmed.startsWith("```"):
+    let nl = trimmed.find('\n')
+    if nl < 0:
+      raise newException(FruitMarketError,
+        "no JSON object in response: " & utf8Snippet(text, 160))
+    let tag = trimmed[3 ..< nl].strip().toLowerAscii()
+    if tag notin ["", "json"]:
+      raise newException(FruitMarketError,
+        "unsupported code fence tag in response: " & utf8Snippet(text, 160))
+    let rest = trimmed[nl + 1 .. ^1]
+    if not rest.endsWith("```"):
+      raise newException(FruitMarketError,
+        "unclosed code fence in response: " & utf8Snippet(text, 160))
+    let beforeClose = rest[0 ..< rest.len - 3]
+    if not beforeClose.strip(leading = false, chars = {' ', '\t'}).endsWith("\n"):
+      raise newException(FruitMarketError,
+        "malformed closing code fence in response: " & utf8Snippet(text, 160))
+    candidate = beforeClose.strip()
+  if candidate.len == 0 or candidate[0] != '{' or candidate[^1] != '}':
+    raise newException(FruitMarketError,
+      "no JSON object in response: " & utf8Snippet(text, 160))
+  try:
+    result = parseJson(candidate)
+  except JsonParsingError as error:
+    raise newException(FruitMarketError,
+      "invalid JSON object in response: " & utf8Snippet(error.msg, 160))
+  if result.isNil or result.kind != JObject:
+    raise newException(FruitMarketError,
+      "no JSON object in response: " & utf8Snippet(text, 160))
 
 proc requestFor(client: LlmClient, system, user: string, slot: int):
     tuple[url: string, headers: HttpHeaders, body: string] =
@@ -584,35 +644,52 @@ proc requestFor(client: LlmClient, system, user: string, slot: int):
   result.headers = headers
   result.body = $body
 
+proc newInfraError(cause, msg: string): ref LlmInfraError =
+  result = newException(LlmInfraError, msg)
+  result.cause = cause
+
+proc newModelError(cause, msg: string): ref LlmModelError =
+  result = newException(LlmModelError, msg)
+  result.cause = cause
+
 proc textOfBody*(body: string): string =
   ## The text of a 2xx reply. A refusal and a `max_tokens` stop before any `{`
   ## both raise BY NAME — the max_tokens signature otherwise shows up as the
   ## misleading "unbalanced JSON object" (hanabi, 2026-08-24).
-  let payload = parseJson(body)
+  var payload: JsonNode
+  try:
+    payload = parseJson(body)
+  except JsonParsingError as error:
+    raise newInfraError("provider_invalid_response",
+      "llm invalid JSON envelope: " & utf8Snippet(error.msg, 160))
   if payload{"stop_reason"}.getStr() == "refusal":
-    raise newException(FruitMarketError, "llm refusal")
+    raise newModelError("model_refusal", "llm refusal")
   let content = payload{"content"}
   if not content.isNil and content.kind == JArray:
     for contentBlock in content:
       if contentBlock{"type"}.getStr() == "text":
         result.add(contentBlock{"text"}.getStr())
   if payload{"stop_reason"}.getStr() == "max_tokens" and '{' notin result:
-    raise newException(FruitMarketError,
+    raise newModelError("model_max_tokens",
       "reply cut off at max_tokens mid-JSON: " & utf8Snippet(result, 160))
 
 proc textOf(client: LlmClient, response: Response, error, url: string): string =
   if error.len > 0:
-    raise newException(FruitMarketError, "llm transport: " & error)
+    let lower = error.toLowerAscii()
+    let cause =
+      if "timeout" in lower or "timed out" in lower: "provider_timeout"
+      else: "provider_transport_error"
+    raise newInfraError(cause, "llm transport: " & error)
   if response.code == 401 or response.code == 403:
     client.disabled = true
-    raise newException(FruitMarketError, "llm auth failed (" & $response.code &
-      "): " & utf8Snippet(response.body, 300))
+    raise newInfraError("provider_auth_error", "llm auth failed (" &
+      $response.code & "): " & utf8Snippet(response.body, 300))
   if response.code == 429:
-    raise newException(FruitMarketError, "llm throttled (429): " &
+    raise newInfraError("provider_rate_limit", "llm throttled (429): " &
       utf8Snippet(response.body, 200))
   if response.code < 200 or response.code >= 300:
-    raise newException(FruitMarketError, "llm error " & $response.code & ": " &
-      utf8Snippet(response.body, 200))
+    raise newInfraError("provider_http_error", "llm error " & $response.code &
+      ": " & utf8Snippet(response.body, 200))
   textOfBody(response.body)
 
 # ---- the reply schema --------------------------------------------------------
@@ -624,7 +701,7 @@ proc parseFruit(node: JsonNode, field: string): Fruit =
   if node.kind != JString:
     raise newException(FruitMarketError,
       "unknown fruit in " & field & ": " & $node)
-  case node.getStr().strip().toLowerAscii()
+  case node.getStr()
   of "apple": fApple
   of "banana": fBanana
   else:
@@ -635,33 +712,36 @@ proc offerCount(node: JsonNode, field: string, config: GameConfig):
     tuple[value: int, clamped: bool] =
   if node.isNil:
     raise newException(FruitMarketError, "missing " & field)
-  var raw: int
-  case node.kind
-  of JInt:
-    raw = node.getInt()
-  of JString:
-    try:
-      raw = parseInt(node.getStr().strip())
-    except ValueError:
-      raise newException(FruitMarketError, "offer n is not an integer: " & $node)
-  else:
+  if node.kind != JInt:
     raise newException(FruitMarketError, "offer n must be an integer: " & $node)
-  clampOfferN(config, raw)
+  clampOfferN(config, node.getInt())
+
+proc optionalText(payload: JsonNode, field: string, limit: int): string =
+  let node = payload{field}
+  if node.isNil or node.kind == JNull:
+    return ""
+  if node.kind != JString:
+    raise newException(FruitMarketError, field & " must be a string")
+  cleanText(node.getStr(), limit)
 
 proc parseOrder*(payload: JsonNode, sim: Sim, slot: int): Order =
-  ## Tolerant parse of one reply. Anything the table in the design note marks
-  ## "invalid reply" raises; `n` outside the range is CLAMPED and flagged.
+  ## Strict parse of one standing-order object. Unknown keys, wrong types, and
+  ## non-canonical enum values raise; `n` outside 1..offerMax is clamped and
+  ## flagged per game rules.
   if payload.isNil or payload.kind != JObject:
     raise newException(FruitMarketError, "order must be a JSON object")
+  for key, _ in payload:
+    if key notin ["job", "fruit", "stall", "eat", "offer", "say", "notes"]:
+      raise newException(FruitMarketError, "unknown order field: " & key)
   let cog = sim.cogs[slot]
   result.source = osLlm
-  result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesLen)
-  result.say = cleanText(payload{"say"}.getStr(), MaxSayLen)
+  result.notes = optionalText(payload, "notes", MaxNotesLen)
+  result.say = optionalText(payload, "say", MaxSayLen)
 
   let jobNode = payload{"job"}
   if jobNode.isNil or jobNode.kind != JString:
     raise newException(FruitMarketError, "no job in reply")
-  case jobNode.getStr().strip().toLowerAscii()
+  case jobNode.getStr()
   of "harvest": result.job = jHarvest
   of "market": result.job = jMarket
   of "trek": result.job = jTrek
@@ -670,8 +750,7 @@ proc parseOrder*(payload: JsonNode, sim: Sim, slot: int): Order =
     raise newException(FruitMarketError, "unknown job: " & jobNode.getStr())
 
   let fruitNode = payload{"fruit"}
-  if fruitNode.isNil or fruitNode.kind == JNull or
-      (fruitNode.kind == JString and fruitNode.getStr().strip().len == 0):
+  if fruitNode.isNil or fruitNode.kind == JNull:
     result.fruit = if result.job == jTrek: cog.craved() else: cog.farm
     result.hasFruit = false
   else:
@@ -679,9 +758,10 @@ proc parseOrder*(payload: JsonNode, sim: Sim, slot: int): Order =
     result.hasFruit = true
 
   let stallNode = payload{"stall"}
-  if not stallNode.isNil and stallNode.kind == JString and
-      stallNode.getStr().strip().len > 0:
-    case stallNode.getStr().strip().toLowerAscii()
+  if not stallNode.isNil and stallNode.kind != JNull:
+    if stallNode.kind != JString:
+      raise newException(FruitMarketError, "unknown stall: " & $stallNode)
+    case stallNode.getStr()
     of "north": result.stall = stNorth
     of "east": result.stall = stEast
     of "south": result.stall = stSouth
@@ -691,10 +771,12 @@ proc parseOrder*(payload: JsonNode, sim: Sim, slot: int): Order =
     result.hasStall = true
 
   let eatNode = payload{"eat"}
-  if eatNode.isNil or eatNode.kind != JString or eatNode.getStr().len == 0:
+  if eatNode.isNil or eatNode.kind == JNull:
     result.eat = epAny
   else:
-    case eatNode.getStr().strip().toLowerAscii()
+    if eatNode.kind != JString:
+      raise newException(FruitMarketError, "unknown eat: " & $eatNode)
+    case eatNode.getStr()
     of "crave": result.eat = epCrave
     of "any": result.eat = epAny
     of "none": result.eat = epNone
@@ -711,11 +793,20 @@ proc parseOrder*(payload: JsonNode, sim: Sim, slot: int): Order =
           not offerNode.hasKey("want"):
         raise newException(FruitMarketError, "offer must be an object with " &
           "give and want, or null")
+      for key, _ in offerNode:
+        if key notin ["give", "want"]:
+          raise newException(FruitMarketError, "unknown offer field: " & key)
       let
         give = offerNode["give"]
         want = offerNode["want"]
       if give.isNil or want.isNil or give.kind != JObject or want.kind != JObject:
         raise newException(FruitMarketError, "offer give/want must be objects")
+      for key, _ in give:
+        if key notin ["fruit", "n"]:
+          raise newException(FruitMarketError, "unknown offer.give field: " & key)
+      for key, _ in want:
+        if key notin ["fruit", "n"]:
+          raise newException(FruitMarketError, "unknown offer.want field: " & key)
       let
         giveFruit = parseFruit(give{"fruit"}, "offer.give.fruit")
         wantFruit = parseFruit(want{"fruit"}, "offer.want.fruit")
@@ -756,10 +847,13 @@ proc decideAll*(
   scripted: array[Seats, ScriptKind],
   connected: array[Seats, bool],
   selection: PromptSelection,
-  capture: RuntimeCapture = nil
-): array[Seats, Order] =
-  ## One standing order per seat. NEVER raises: any failure falls back to the
-  ## `hauler` order so the episode always advances.
+  capture: RuntimeCapture = nil,
+  external: array[Seats, bool] = default(array[Seats, bool])
+): DecisionBatchResult =
+  ## One standing order per seat. NEVER substitutes a fake move: any failed,
+  ## disconnected, or uncredentialed prompt seat is returned in `result.failures`
+  ## with its classified cause so the server terminates the unfinished episode
+  ## unscored.
   if capture != nil:
     var observations: seq[JsonNode]
     for slot in 0 ..< Seats:
@@ -771,12 +865,32 @@ proc decideAll*(
   for slot in 0 ..< Seats:
     let kind = scripted[slot]
     if kind != skNone:
-      result[slot] = scriptedOrder(sim, slot, kind)
-    elif client.disabled or not connected[slot]:
-      result[slot] = Order(job: jRest, eat: epNone, source: osFallback)
+      result.orders[slot] = scriptedOrder(sim, slot, kind)
+      result.decided[slot] = true
+    elif external[slot]:
+      ## External seats supply their own standing orders through /player.
+      discard
+    elif not connected[slot]:
+      result.failures.add(SeatFailure(
+        slot: slot,
+        kind: dfkInfrastructure,
+        cause: "player_disconnected",
+        detail: "seat " & $slot & " is not connected"
+      ))
+    elif client.disabled:
+      result.failures.add(SeatFailure(
+        slot: slot,
+        kind: dfkInfrastructure,
+        cause: "missing_credentials",
+        detail: "no LLM credentials configured for prompt seat " & $slot
+      ))
     else:
       open.add(slot)
 
+  if result.failures.len > 0:
+    return
+
+  var lastFailure: array[Seats, SeatFailure]
   for attempt in 0 .. 1:
     if open.len == 0 or client.disabled:
       break
@@ -806,12 +920,34 @@ proc decideAll*(
           evidence.accepted = proposal == order.orderJson()
           if not evidence.accepted:
             evidence.rejectionReason = some("native parser normalized proposal")
-        result[slot] = order
+        result.orders[slot] = order
+        result.decided[slot] = true
+      except LlmInfraError as error:
+        let reason = utf8Snippet(error.msg, MaxErrorLen)
+        if capture != nil: evidence.rejectionReason = some(reason)
+        echo "fruit-market llm: seat ", slot, " attempt ", attempt,
+          " infra failure (", error.cause, "): ", reason
+        lastFailure[slot] = SeatFailure(
+          slot: slot, kind: dfkInfrastructure,
+          cause: error.cause, detail: reason)
+        stillOpen.add(slot)
+      except LlmModelError as error:
+        let reason = utf8Snippet(error.msg, MaxErrorLen)
+        if capture != nil: evidence.rejectionReason = some(reason)
+        echo "fruit-market llm: seat ", slot, " attempt ", attempt,
+          " model failure (", error.cause, "): ", reason
+        lastFailure[slot] = SeatFailure(
+          slot: slot, kind: dfkModelInvalid,
+          cause: error.cause, detail: reason)
+        stillOpen.add(slot)
       except CatchableError as error:
         let reason = utf8Snippet(error.msg, MaxErrorLen)
         if capture != nil: evidence.rejectionReason = some(reason)
         echo "fruit-market llm: seat ", slot, " attempt ", attempt,
-          " failed: ", reason
+          " invalid order: ", reason
+        lastFailure[slot] = SeatFailure(
+          slot: slot, kind: dfkModelInvalid,
+          cause: "model_invalid_action", detail: reason)
         stillOpen.add(slot)
       if capture != nil:
         capture.recordAttempt(slot, evidence, selection.promptMetadata(
@@ -820,5 +956,6 @@ proc decideAll*(
     open = stillOpen
 
   for slot in open:
-    echo "fruit-market llm: seat ", slot, " falling back to rest order"
-    result[slot] = Order(job: jRest, eat: epNone, source: osFallback)
+    echo "fruit-market llm: seat ", slot, " failed (",
+      lastFailure[slot].cause, "): ", lastFailure[slot].detail
+    result.failures.add(lastFailure[slot])

@@ -100,7 +100,12 @@ when isMainModule:
         socket.send(promptFrame())
         registeredAt = epochTime()
       of "final":
-        echo "fruit-market player: final scores ", payload{"scores"}
+        if payload.hasKey("scores") and payload["scores"].kind != JNull:
+          echo "fruit-market player: final scores ", payload["scores"]
+        else:
+          echo "fruit-market player: episode ended without scores (",
+            payload{"reason"}.getStr(), ": ",
+            payload{"failure_cause"}.getStr(payload{"ending"}.getStr()), ")"
         break
       else:
         discard

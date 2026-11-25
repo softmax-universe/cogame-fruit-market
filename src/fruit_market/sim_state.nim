@@ -18,8 +18,13 @@ type
     round*: int              ## rounds completed
     roundsPlayed*: int
     done*: bool
-    reason*: string          ## complete | deadline | forfeit
-    ending*: string          ## round_limit | famine | deadline | forfeit
+    reason*: string          ## complete | deadline | failed
+    ending*: string          ## round_limit | famine | deadline | <failure_cause>
+    failed*: bool
+    failureCategory*: string ## "" | infrastructure | model_invalid
+    failureCause*: string
+    failureDetail*: string
+    failedSeats*: seq[int]
     famineLatched*: bool
     firstTradeTick*: int
     events*: seq[SimEvent]
@@ -163,9 +168,36 @@ proc echoLog*(sim: Sim, parts: varargs[string, `$`]) =
     line.add(part)
   echo line
 
+proc failureJson*(sim: Sim): JsonNode =
+  ## Unscored terminal failure record: no authoritative gameplay scores or
+  ## winners are emitted when an unfinished episode fails.
+  var
+    names = newJArray()
+    aliases = newJArray()
+    seats = newJArray()
+  for slot in 0 ..< Seats:
+    names.add(%sim.policyNames[slot])
+    aliases.add(%sim.aliases[slot])
+  for slot in sim.failedSeats:
+    seats.add(%slot)
+  %*{
+    "names": names,
+    "aliases": aliases,
+    "rounds": sim.roundsPlayed,
+    "reason": "failed",
+    "ending": (if sim.failureCause.len > 0: sim.failureCause else: "error"),
+    "failure_category": sim.failureCategory,
+    "failure_cause": sim.failureCause,
+    "failure_detail": sim.failureDetail,
+    "failed_seats": seats
+  }
+
 proc resultsJson*(sim: Sim): JsonNode =
   ## `names` are POLICY names (platform side); aliases go to the players and
-  ## into the replay's `names[]`.
+  ## into the replay's `names[]`. Failed episodes never emit numeric scores or
+  ## winners.
+  if sim.failed:
+    return sim.failureJson()
   var
     names = newJArray()
     aliases = newJArray()

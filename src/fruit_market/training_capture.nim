@@ -102,11 +102,35 @@ proc applied*(capture: RuntimeCapture, seat, tick: int, action: JsonNode,
     capture.turn[seat].observation, attempts, selected, action, status,
     fallbackOrigin = (if origin == aoFallback: some(policy) else: none(string)))
 
+proc recordExternalRejectedAttempt*(capture: RuntimeCapture, seat, tick, index: int,
+    policy, reason: string) =
+  if capture == nil: return
+  var attempt = newDecisionAttempt($tick & "-" & $seat & "-ext-rejected-" & $index,
+    policy, aoUnknown)
+  attempt.rejectionReason = some(reason)
+  capture.turn[seat].attempts.add(attempt)
+
+proc recordFailedDecision*(capture: RuntimeCapture, seat, tick: int,
+    status: ActionStatus, policy, reason: string) =
+  ## Record a seat decision that failed without executing a substituted move.
+  if capture == nil: return
+  var attempts = capture.turn[seat].attempts
+  if attempts.len == 0:
+    var missing = newDecisionAttempt($tick & "-" & $seat & "-missing",
+      policy, aoUnknown)
+    missing.rejectionReason = some(reason)
+    attempts.add(missing)
+  capture.trajectory.recordDecision($tick & "-" & $seat, $seat,
+    capture.turn[seat].observation, attempts, none(string), newJNull(),
+    status, terminal = true)
+
 proc finishCapture*(capture: RuntimeCapture, outcome: JsonNode) =
   if capture == nil: return
   let status = case outcome{"reason"}.getStr()
     of "complete": esCompleted
     of "deadline": esTruncated
     else: esFailed
-  capture.trajectory.finish(status, outcome, outcome{"scores"})
+  let participantOutcomes =
+    if outcome.hasKey("scores"): outcome["scores"] else: newJNull()
+  capture.trajectory.finish(status, outcome, participantOutcomes)
   capture.trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
