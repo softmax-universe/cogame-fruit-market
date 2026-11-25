@@ -53,10 +53,10 @@ seat-private observation. The player replies with
 `{"type":"order","round":R,"order":{...}}`, using the standing-order schema
 below. The game parses that order and applies the same strict rules as prompt
 orders. If a prompt seat hits missing credentials, a provider/transport error,
-timeout, disconnect, or exhausted invalid replies after one retry — or if an
-external seat disconnects or submits no valid order before the round deadline —
-the game terminates the unfinished episode as failed with recorded diagnostics
-and emits no authoritative gameplay scores or winners.
+timeout, disconnect, or an invalid reply — or if an external seat disconnects
+or submits no valid order before the round deadline — the game terminates the
+unfinished episode as failed with a `GamePlayerFailure` record and emits no
+authoritative gameplay scores or winners.
 
 ## The standing order
 

@@ -6,10 +6,9 @@
 ##
 ## Decisions within a round are SIMULTANEOUS by rule, so all eight seats'
 ## requests go out as ONE parallel batch (`curly.makeRequests`) — never
-## sequentially and never one seat at a time. An invalid reply is retried once,
-## in the same round's retry batch, with a hint; anything still failing returns
-## an explicit seat failure so the server closes the unfinished episode unscored
-## rather than substituting a fake move.
+## sequentially and never one seat at a time. A failed request or invalid reply
+## is not retried and never substituted with a fake move: it returns an explicit
+## seat failure so the server closes the unfinished episode unscored.
 ##
 ## Credentials, in order: Bedrock sidecar -> ANTHROPIC_API_KEY ->
 ## ANTHROPIC_API_KEY_URI. With none the client disables itself immediately and
@@ -890,72 +889,62 @@ proc decideAll*(
   if result.failures.len > 0:
     return
 
-  var lastFailure: array[Seats, SeatFailure]
-  for attempt in 0 .. 1:
-    if open.len == 0 or client.disabled:
-      break
-    let started = epochTime()
-    var batch = client.buildBatch(sim, prompts, open, attempt, selection)
-    ## ONE parallel batch for the whole round — this is a simultaneous-decision
-    ## game and a sequential sweep would blow the play budget.
-    let responses = client.curl.makeRequests(batch, client.timeoutSeconds)
-    let latency = int((epochTime() - started) * 1000.0)
-    var stillOpen: seq[int]
-    for position, slot in open:
-      var evidence: DecisionAttempt
-      if capture != nil:
-        evidence = modelAttempt($sim.tick & "-" & $slot & "-" & $attempt,
-          sim.policyNames[slot], client.model, batch[position].body,
-          responses[position].response, responses[position].error, latency)
-      try:
-        let text = client.textOf(responses[position].response,
-          responses[position].error, batch[position].url)
-        if capture != nil: evidence.response = %text
-        let proposal = extractJsonObject(text)
-        var order = parseOrder(proposal, sim, slot)
-        order.source = if attempt == 0: osLlm else: osRetry
-        order.latencyMs = latency
-        if capture != nil:
-          evidence.parsedAction = copy(proposal)
-          evidence.accepted = proposal == order.orderJson()
-          if not evidence.accepted:
-            evidence.rejectionReason = some("native parser normalized proposal")
-        result.orders[slot] = order
-        result.decided[slot] = true
-      except LlmInfraError as error:
-        let reason = utf8Snippet(error.msg, MaxErrorLen)
-        if capture != nil: evidence.rejectionReason = some(reason)
-        echo "fruit-market llm: seat ", slot, " attempt ", attempt,
-          " infra failure (", error.cause, "): ", reason
-        lastFailure[slot] = SeatFailure(
-          slot: slot, kind: dfkInfrastructure,
-          cause: error.cause, detail: reason)
-        stillOpen.add(slot)
-      except LlmModelError as error:
-        let reason = utf8Snippet(error.msg, MaxErrorLen)
-        if capture != nil: evidence.rejectionReason = some(reason)
-        echo "fruit-market llm: seat ", slot, " attempt ", attempt,
-          " model failure (", error.cause, "): ", reason
-        lastFailure[slot] = SeatFailure(
-          slot: slot, kind: dfkModelInvalid,
-          cause: error.cause, detail: reason)
-        stillOpen.add(slot)
-      except CatchableError as error:
-        let reason = utf8Snippet(error.msg, MaxErrorLen)
-        if capture != nil: evidence.rejectionReason = some(reason)
-        echo "fruit-market llm: seat ", slot, " attempt ", attempt,
-          " invalid order: ", reason
-        lastFailure[slot] = SeatFailure(
-          slot: slot, kind: dfkModelInvalid,
-          cause: "model_invalid_action", detail: reason)
-        stillOpen.add(slot)
-      if capture != nil:
-        capture.recordAttempt(slot, evidence, selection.promptMetadata(
-          evidence.request["system"].getStr(),
-          evidence.request["messages"][0]["content"].getStr()))
-    open = stillOpen
+  if open.len == 0 or client.disabled:
+    return
 
-  for slot in open:
-    echo "fruit-market llm: seat ", slot, " failed (",
-      lastFailure[slot].cause, "): ", lastFailure[slot].detail
-    result.failures.add(lastFailure[slot])
+  let started = epochTime()
+  var batch = client.buildBatch(sim, prompts, open, 0, selection)
+  ## ONE parallel batch for the whole round — this is a simultaneous-decision
+  ## game and a sequential sweep would blow the play budget. Model calls are
+  ## never retried on failure.
+  let responses = client.curl.makeRequests(batch, client.timeoutSeconds)
+  let latency = int((epochTime() - started) * 1000.0)
+  for position, slot in open:
+    var evidence: DecisionAttempt
+    if capture != nil:
+      evidence = modelAttempt($sim.tick & "-" & $slot & "-0",
+        sim.policyNames[slot], client.model, batch[position].body,
+        responses[position].response, responses[position].error, latency)
+    try:
+      let text = client.textOf(responses[position].response,
+        responses[position].error, batch[position].url)
+      if capture != nil: evidence.response = %text
+      let proposal = extractJsonObject(text)
+      var order = parseOrder(proposal, sim, slot)
+      order.source = osLlm
+      order.latencyMs = latency
+      if capture != nil:
+        evidence.parsedAction = copy(proposal)
+        evidence.accepted = proposal == order.orderJson()
+        if not evidence.accepted:
+          evidence.rejectionReason = some("native parser normalized proposal")
+      result.orders[slot] = order
+      result.decided[slot] = true
+    except LlmInfraError as error:
+      let reason = utf8Snippet(error.msg, MaxErrorLen)
+      if capture != nil: evidence.rejectionReason = some(reason)
+      echo "fruit-market llm: seat ", slot,
+        " infra failure (", error.cause, "): ", reason
+      result.failures.add(SeatFailure(
+        slot: slot, kind: dfkInfrastructure,
+        cause: error.cause, detail: reason))
+    except LlmModelError as error:
+      let reason = utf8Snippet(error.msg, MaxErrorLen)
+      if capture != nil: evidence.rejectionReason = some(reason)
+      echo "fruit-market llm: seat ", slot,
+        " model failure (", error.cause, "): ", reason
+      result.failures.add(SeatFailure(
+        slot: slot, kind: dfkModelInvalid,
+        cause: error.cause, detail: reason))
+    except CatchableError as error:
+      let reason = utf8Snippet(error.msg, MaxErrorLen)
+      if capture != nil: evidence.rejectionReason = some(reason)
+      echo "fruit-market llm: seat ", slot,
+        " invalid order: ", reason
+      result.failures.add(SeatFailure(
+        slot: slot, kind: dfkModelInvalid,
+        cause: "model_invalid_action", detail: reason))
+    if capture != nil:
+      capture.recordAttempt(slot, evidence, selection.promptMetadata(
+        evidence.request["system"].getStr(),
+        evidence.request["messages"][0]["content"].getStr()))
