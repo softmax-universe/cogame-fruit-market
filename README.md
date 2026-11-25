@@ -45,14 +45,15 @@ their player socket. One image also carries both scripted baselines, selected by
 | `PLAYER_PROMPT="<strategy in words>"` | an LLM seat |
 | `PLAYER_SCRIPTED=hauler` | the market maker: bank three of your own fruit, walk to the round's rendezvous stall, post the book price (three of yours for two of theirs) |
 | `PLAYER_SCRIPTED=homesteader` | the autarky foil: never trade, farm your own grove, trek across both rivers for the fruit you crave |
-| neither | `hauler` |
+| neither | the default LLM prompt policy |
 
 An external player registers with `{"type":"register","control":"external"}`.
 The game sends a `state` frame for each round, containing its existing
 seat-private observation. The player replies with
 `{"type":"order","round":R,"order":{...}}`, using the standing-order schema
 below. The game parses that order, applies the same rules as prompt orders,
-and uses `hauler` if the external player misses the round deadline.
+and falls back to a passive `rest` (`eat: none`) order if the external player
+misses the round deadline or submits no valid order.
 
 ## The standing order
 

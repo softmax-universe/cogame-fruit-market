@@ -8,12 +8,12 @@
 ## requests go out as ONE parallel batch (`curly.makeRequests`) — never
 ## sequentially and never one seat at a time. An invalid reply is retried once,
 ## in the same round's retry batch, with a hint; anything still failing falls
-## back to the `hauler` order and is recorded `"source":"fallback"`.
+## back to a passive rest/no-eat order and is recorded `"source":"fallback"`.
 ##
 ## Credentials, in order: Bedrock sidecar -> ANTHROPIC_API_KEY ->
 ## ANTHROPIC_API_KEY_URI. With none the client disables itself immediately and
-## every seat plays `hauler`, which is what keeps offline certification green
-## and deterministic.
+## prompt seats take the passive rest/no-eat fallback (scripted seats still run
+## their configured baseline).
 
 import
   std/[json, os, strutils, times, unicode],
@@ -112,7 +112,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "fruit-market llm: no LLM credentials; every seat plays hauler"
+    echo "fruit-market llm: no LLM credentials; prompt seats rest (fallback)"
 
 # ---- the observation --------------------------------------------------------
 
@@ -545,15 +545,43 @@ proc utf8Snippet(text: string, limit: int): string =
   cleanText(valid, limit)
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first {...} object out of a model response, tolerating fences
-  ## and trailing prose.
-  let
-    start = text.find('{')
-    stop = text.rfind('}')
-  if start < 0 or stop <= start:
+  ## Parses exactly one JSON object: either bare or inside a single ordinary
+  ## outer Markdown code fence (plain ``` or ```json). Rejects surrounding
+  ## prose, extra objects, and non-JSON fence tags.
+  let trimmed = text.strip()
+  if trimmed.len == 0:
     raise newException(FruitMarketError,
       "no JSON object in response: " & utf8Snippet(text, 160))
-  parseJson(text[start .. stop])
+  var candidate = trimmed
+  if trimmed.startsWith("```"):
+    let nl = trimmed.find('\n')
+    if nl < 0:
+      raise newException(FruitMarketError,
+        "no JSON object in response: " & utf8Snippet(text, 160))
+    let tag = trimmed[3 ..< nl].strip().toLowerAscii()
+    if tag notin ["", "json"]:
+      raise newException(FruitMarketError,
+        "unsupported code fence tag in response: " & utf8Snippet(text, 160))
+    let rest = trimmed[nl + 1 .. ^1]
+    if not rest.endsWith("```"):
+      raise newException(FruitMarketError,
+        "unclosed code fence in response: " & utf8Snippet(text, 160))
+    let beforeClose = rest[0 ..< rest.len - 3]
+    if not beforeClose.strip(leading = false, chars = {' ', '\t'}).endsWith("\n"):
+      raise newException(FruitMarketError,
+        "malformed closing code fence in response: " & utf8Snippet(text, 160))
+    candidate = beforeClose.strip()
+  if candidate.len == 0 or candidate[0] != '{' or candidate[^1] != '}':
+    raise newException(FruitMarketError,
+      "no JSON object in response: " & utf8Snippet(text, 160))
+  try:
+    result = parseJson(candidate)
+  except JsonParsingError as error:
+    raise newException(FruitMarketError,
+      "invalid JSON object in response: " & utf8Snippet(error.msg, 160))
+  if result.isNil or result.kind != JObject:
+    raise newException(FruitMarketError,
+      "no JSON object in response: " & utf8Snippet(text, 160))
 
 proc requestFor(client: LlmClient, system, user: string, slot: int):
     tuple[url: string, headers: HttpHeaders, body: string] =
@@ -624,7 +652,7 @@ proc parseFruit(node: JsonNode, field: string): Fruit =
   if node.kind != JString:
     raise newException(FruitMarketError,
       "unknown fruit in " & field & ": " & $node)
-  case node.getStr().strip().toLowerAscii()
+  case node.getStr()
   of "apple": fApple
   of "banana": fBanana
   else:
@@ -635,33 +663,36 @@ proc offerCount(node: JsonNode, field: string, config: GameConfig):
     tuple[value: int, clamped: bool] =
   if node.isNil:
     raise newException(FruitMarketError, "missing " & field)
-  var raw: int
-  case node.kind
-  of JInt:
-    raw = node.getInt()
-  of JString:
-    try:
-      raw = parseInt(node.getStr().strip())
-    except ValueError:
-      raise newException(FruitMarketError, "offer n is not an integer: " & $node)
-  else:
+  if node.kind != JInt:
     raise newException(FruitMarketError, "offer n must be an integer: " & $node)
-  clampOfferN(config, raw)
+  clampOfferN(config, node.getInt())
+
+proc optionalText(payload: JsonNode, field: string, limit: int): string =
+  let node = payload{field}
+  if node.isNil or node.kind == JNull:
+    return ""
+  if node.kind != JString:
+    raise newException(FruitMarketError, field & " must be a string")
+  cleanText(node.getStr(), limit)
 
 proc parseOrder*(payload: JsonNode, sim: Sim, slot: int): Order =
-  ## Tolerant parse of one reply. Anything the table in the design note marks
-  ## "invalid reply" raises; `n` outside the range is CLAMPED and flagged.
+  ## Strict parse of one standing-order object. Unknown keys, wrong types, and
+  ## non-canonical enum values raise; `n` outside 1..offerMax is clamped and
+  ## flagged per game rules.
   if payload.isNil or payload.kind != JObject:
     raise newException(FruitMarketError, "order must be a JSON object")
+  for key, _ in payload:
+    if key notin ["job", "fruit", "stall", "eat", "offer", "say", "notes"]:
+      raise newException(FruitMarketError, "unknown order field: " & key)
   let cog = sim.cogs[slot]
   result.source = osLlm
-  result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesLen)
-  result.say = cleanText(payload{"say"}.getStr(), MaxSayLen)
+  result.notes = optionalText(payload, "notes", MaxNotesLen)
+  result.say = optionalText(payload, "say", MaxSayLen)
 
   let jobNode = payload{"job"}
   if jobNode.isNil or jobNode.kind != JString:
     raise newException(FruitMarketError, "no job in reply")
-  case jobNode.getStr().strip().toLowerAscii()
+  case jobNode.getStr()
   of "harvest": result.job = jHarvest
   of "market": result.job = jMarket
   of "trek": result.job = jTrek
@@ -670,8 +701,7 @@ proc parseOrder*(payload: JsonNode, sim: Sim, slot: int): Order =
     raise newException(FruitMarketError, "unknown job: " & jobNode.getStr())
 
   let fruitNode = payload{"fruit"}
-  if fruitNode.isNil or fruitNode.kind == JNull or
-      (fruitNode.kind == JString and fruitNode.getStr().strip().len == 0):
+  if fruitNode.isNil or fruitNode.kind == JNull:
     result.fruit = if result.job == jTrek: cog.craved() else: cog.farm
     result.hasFruit = false
   else:
@@ -679,9 +709,10 @@ proc parseOrder*(payload: JsonNode, sim: Sim, slot: int): Order =
     result.hasFruit = true
 
   let stallNode = payload{"stall"}
-  if not stallNode.isNil and stallNode.kind == JString and
-      stallNode.getStr().strip().len > 0:
-    case stallNode.getStr().strip().toLowerAscii()
+  if not stallNode.isNil and stallNode.kind != JNull:
+    if stallNode.kind != JString:
+      raise newException(FruitMarketError, "unknown stall: " & $stallNode)
+    case stallNode.getStr()
     of "north": result.stall = stNorth
     of "east": result.stall = stEast
     of "south": result.stall = stSouth
@@ -691,10 +722,12 @@ proc parseOrder*(payload: JsonNode, sim: Sim, slot: int): Order =
     result.hasStall = true
 
   let eatNode = payload{"eat"}
-  if eatNode.isNil or eatNode.kind != JString or eatNode.getStr().len == 0:
+  if eatNode.isNil or eatNode.kind == JNull:
     result.eat = epAny
   else:
-    case eatNode.getStr().strip().toLowerAscii()
+    if eatNode.kind != JString:
+      raise newException(FruitMarketError, "unknown eat: " & $eatNode)
+    case eatNode.getStr()
     of "crave": result.eat = epCrave
     of "any": result.eat = epAny
     of "none": result.eat = epNone
@@ -711,11 +744,20 @@ proc parseOrder*(payload: JsonNode, sim: Sim, slot: int): Order =
           not offerNode.hasKey("want"):
         raise newException(FruitMarketError, "offer must be an object with " &
           "give and want, or null")
+      for key, _ in offerNode:
+        if key notin ["give", "want"]:
+          raise newException(FruitMarketError, "unknown offer field: " & key)
       let
         give = offerNode["give"]
         want = offerNode["want"]
       if give.isNil or want.isNil or give.kind != JObject or want.kind != JObject:
         raise newException(FruitMarketError, "offer give/want must be objects")
+      for key, _ in give:
+        if key notin ["fruit", "n"]:
+          raise newException(FruitMarketError, "unknown offer.give field: " & key)
+      for key, _ in want:
+        if key notin ["fruit", "n"]:
+          raise newException(FruitMarketError, "unknown offer.want field: " & key)
       let
         giveFruit = parseFruit(give{"fruit"}, "offer.give.fruit")
         wantFruit = parseFruit(want{"fruit"}, "offer.want.fruit")
@@ -758,8 +800,9 @@ proc decideAll*(
   selection: PromptSelection,
   capture: RuntimeCapture = nil
 ): array[Seats, Order] =
-  ## One standing order per seat. NEVER raises: any failure falls back to the
-  ## `hauler` order so the episode always advances.
+  ## One standing order per seat. NEVER raises: any failed or disconnected
+  ## non-scripted seat falls back to a passive rest/no-eat order so the episode
+  ## always advances without inserting a scripted strategy.
   if capture != nil:
     var observations: seq[JsonNode]
     for slot in 0 ..< Seats:

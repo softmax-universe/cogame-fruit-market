@@ -151,6 +151,9 @@ def _run_external_malformed_then_valid_seat(
                     json.dumps({"type": "order", "round": round_no, "order": None}),
                 )
                 summary_out["malformed_sent"] += 2
+                if round_no == 6:
+                    # Leave round 6 without a valid order to verify passive rest fallback (never hauler).
+                    continue
                 if round_no % 2 == 1:
                     valid_order: dict[str, object] = {
                         "job": "harvest",
@@ -302,6 +305,28 @@ def _malformed_fruit_reply(slot: int, content: str) -> bytes:
                 ensure_ascii=False,
             ).encode("utf-8")
         return wrap({"job": "harvest", "eat": "any", "say": "utf8-ok", "notes": "ok"})
+    if round_no == 5 and slot == 1:
+        fenced = "```json\n" + json.dumps({"job": "harvest", "eat": "any", "say": "fenced-ok", "notes": "ok"}) + "\n```"
+        return json.dumps(
+            {
+                "model": "loopback-fixture",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": fenced}],
+            }
+        ).encode()
+    if round_no == 6 and slot == 0:
+        bad_text = (
+            'Sure! {"job": "harvest", "eat": "any"}'
+            if not is_retry
+            else '{"job": "rest"}{"job": "harvest"}'
+        )
+        return json.dumps(
+            {
+                "model": "loopback-fixture",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": bad_text}],
+            }
+        ).encode()
     if round_no % 2 == 1:
         return wrap({"job": "harvest", "eat": "any", "say": f"r{round_no}", "notes": "ok"})
     return wrap(
@@ -402,6 +427,7 @@ def main() -> None:
         "players": [{"name": f"fixture-{s}"} for s in range(8)],
         "rounds": 12,
         "minTurnSeconds": 0,
+        "llmTimeoutSeconds": 1 if args.mode == "malformed-fruit" else 20,
         "playerConnectTimeoutSeconds": 10,
         "shutdownGraceSeconds": 0,
     }
@@ -508,7 +534,7 @@ def main() -> None:
     decisions = events[:-1]
     assert len(decisions) == 96
     actual = [a for d in decisions for a in d["attempts"] if a["origin"] == "model"]
-    expected_calls = 30 if args.mode == "malformed-fruit" else 24 if args.mode in ("accepted", "normalized") else 48
+    expected_calls = 31 if args.mode == "malformed-fruit" else 24 if args.mode in ("accepted", "normalized") else 48
     assert len(actual) == len(calls) == expected_calls, (len(actual), len(calls), expected_calls)
     received = {c["id"]: c for c in calls}
     for attempt in actual:
@@ -519,7 +545,7 @@ def main() -> None:
     if args.mode == "malformed-fruit":
         assert external_summary == {
             "malformed_sent": 24,
-            "valid_sent": 12,
+            "valid_sent": 11,
             "saw_final": 1,
         }, external_summary
         assert results["total_trades"] > 0, results
@@ -560,12 +586,26 @@ def main() -> None:
         assert r5s0["action_status"] == "accepted"
         assert r5s0["selected_attempt_id"].endswith("-1")
         assert "no JSON object in response:" in r5s0["attempts"][0]["rejection_reason"]
-        # Seat 2 (external player): all 12 rounds accepted valid external orders after rejecting malformed frames
+        # Round 5 seat 1: single JSON-tagged Markdown code fence accepted cleanly
+        r5s1 = by_round_seat[(5, 1)]
+        assert r5s1["action_status"] == "accepted"
+        assert r5s1["selected_attempt_id"].endswith("-0")
+        assert r5s1["executed_action"]["say"] == "fenced-ok"
+        # Round 6 seat 0: prose-wrapped JSON then extra JSON objects -> passive rest/no-eat fallback
+        r6s0 = by_round_seat[(6, 0)]
+        assert r6s0["action_status"] == "fallback"
+        assert r6s0["executed_action"] == {"job": "rest", "eat": "none", "say": "", "notes": ""}
+        # Seat 2 (external player): 11 rounds accepted valid external orders; round 6 missed -> passive rest fallback
         for r in range(1, 13):
             d_ext = by_round_seat[(r, 2)]
-            assert d_ext["action_status"] == "accepted"
-            assert d_ext["attempts"][0]["origin"] == "unknown"
-            assert d_ext["executed_action"]["notes"] == f"ext-{r}"
+            if r == 6:
+                assert d_ext["action_status"] == "fallback"
+                assert d_ext["executed_action"] == {"job": "rest", "eat": "none", "say": "", "notes": ""}
+                assert d_ext["fallback_origin"] == "engine-fruit-market-fallback"
+            else:
+                assert d_ext["action_status"] == "accepted"
+                assert d_ext["attempts"][0]["origin"] == "unknown"
+                assert d_ext["executed_action"]["notes"] == f"ext-{r}"
         # Seats 3..7: scripted hauler teacher
         for r in range(1, 13):
             for s in range(3, 8):

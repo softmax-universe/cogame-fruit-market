@@ -109,20 +109,59 @@ proc parse(sim: Sim, text: string, slot = 0): Order =
 
 suite "extracting the object":
   let sim = bench()
-  test "a fenced reply":
-    let order = sim.parse("""Sure!
-```json
-{"job": "market", "stall": "north", "eat": "crave"}
-```
-""")
+  test "a bare JSON object":
+    let order = sim.parse("""{"job": "market", "stall": "north", "eat": "crave"}""")
     check order.job == jMarket
     check order.stall == stNorth
     check order.eat == epCrave
 
-  test "a prose-prefixed reply with trailing prose":
-    let order = sim.parse(
-      "I will go and harvest. {\"job\":\"harvest\"} Hope that helps.")
-    check order.job == jHarvest
+  test "a single JSON-tagged or plain outer Markdown code fence":
+    let tagged = sim.parse("""```json
+{"job": "market", "stall": "north", "eat": "crave"}
+```""")
+    check tagged.job == jMarket
+    check tagged.stall == stNorth
+    check tagged.eat == epCrave
+
+    let plain = sim.parse("""```
+{"job": "harvest", "eat": "any"}
+```""")
+    check plain.job == jHarvest
+    check plain.eat == epAny
+
+  test "surrounding prose around bare or fenced JSON is rejected":
+    expect FruitMarketError:
+      discard sim.parse("""Sure!
+```json
+{"job": "market", "stall": "north", "eat": "crave"}
+```
+""")
+    expect FruitMarketError:
+      discard sim.parse(
+        "I will go and harvest. {\"job\":\"harvest\"} Hope that helps.")
+    expect FruitMarketError:
+      discard sim.parse("""```json
+{"job": "rest"}
+```
+Done.""")
+
+  test "extra objects and non-JSON code fences are rejected":
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"rest"}{"job":"harvest"}""")
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"rest"}
+{"job":"harvest"}""")
+    expect FruitMarketError:
+      discard sim.parse("""```json
+{"job":"rest"}
+```
+```json
+{"job":"harvest"}
+```""")
+    expect FruitMarketError:
+      discard sim.parse("""```python
+{"job":"rest"}
+```""")
 
   test "no object at all is an error that quotes the head of the reply":
     expect FruitMarketError:
@@ -146,15 +185,43 @@ suite "the reply schema":
     expect FruitMarketError:
       discard sim.parse("""{"job":"rest","eat":"sometimes"}""")
 
+  test "uppercase, padded, empty, and wrong-type fields are rejected":
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"  HARVEST  "}""")
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"harvest","fruit":""}""")
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"market","stall":123}""")
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"market","stall":""}""")
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"rest","eat":123}""")
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"rest","eat":""}""")
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"rest","say":123}""")
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"rest","notes":["a"]}""")
+
+  test "unknown fields and legacy aliases are rejected":
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"rest","action":"harvest"}""")
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"market","offer":
+        {"give":{"fruit":"apple","n":3,"extra":1},"want":{"fruit":"banana","n":2}}}""")
+
   test "give.fruit == want.fruit is invalid":
     expect FruitMarketError:
       discard sim.parse("""{"job":"market","offer":
         {"give":{"fruit":"apple","n":3},"want":{"fruit":"apple","n":2}}}""")
 
-  test "a non-integer n is invalid":
+  test "a non-integer n (including numeric strings) is invalid":
     expect FruitMarketError:
       discard sim.parse("""{"job":"market","offer":
         {"give":{"fruit":"apple","n":"three"},"want":{"fruit":"banana","n":2}}}""")
+    expect FruitMarketError:
+      discard sim.parse("""{"job":"market","offer":
+        {"give":{"fruit":"apple","n":"3"},"want":{"fruit":"banana","n":2}}}""")
 
   test "n = 9 is clamped to 6 and flagged":
     let order = sim.parse("""{"job":"market","offer":
@@ -193,7 +260,7 @@ suite "the reply schema":
     check game.cogs[0].offer.giveN == 3
 
 suite "degrade, never hang":
-  test "with no credentials every seat plays hauler and nothing raises":
+  test "with no credentials every prompt seat takes the passive rest fallback and nothing raises":
     var game = bench()
     var config = game.config
     let client = newLlmClient(config)
@@ -239,10 +306,10 @@ suite "degrade, never hang":
       let want = if slot < 4: skHauler else: skHomesteader
       check orders[slot] == scriptedOrder(game, slot, want)
 
-suite "a stubbed transport degrades to the scripted order":
+suite "a stubbed transport degrades to the passive rest fallback":
   ## Every one of these routes a REAL request through curly to the stub and
-  ## asserts the seat still gets a legal hauler order marked `fallback` — the
-  ## record phase 60 counts. Nothing raises out of `decideAll`, ever.
+  ## asserts the seat gets the passive rest/no-eat fallback marked `fallback`.
+  ## Nothing raises out of `decideAll`, ever.
   proc runAgainstStub(mode: StubMode, openSeats = Seats,
       timeoutSeconds = 1): array[Seats, Order] =
     startStub(mode)

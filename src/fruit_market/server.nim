@@ -16,7 +16,7 @@ import
 
 import
   ./sim_types, ./sim_config, ./board, ./events, ./sim_state, ./sim,
-  ./scripted, ./llm, ./prompts, ./replays, ./broadcast, ./global, ./wire_constants,
+  ./llm, ./prompts, ./replays, ./broadcast, ./global, ./wire_constants,
   ./training_capture
 
 const
@@ -255,7 +255,9 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         external = state.external
         for slot in 0 ..< Seats:
           if external[slot]:
-            scripts[slot] = skHauler
+            ## External seats supply their own standing orders; exclude them
+            ## from the server's LLM batch without substituting a scripted policy.
+            connected[slot] = false
 
       ## `minTurnSeconds` floors the spacing between BATCH STARTS, so the
       ## episode issues at most 8 requests / minTurnSeconds — under the Bedrock
@@ -289,8 +291,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             if state.orderReceived[slot]:
               orders[slot] = state.externalOrders[slot]
             else:
-              orders[slot] = scriptedOrder(state.sim, slot, skHauler)
-              orders[slot].source = osFallback
+              orders[slot] = Order(job: jRest, eat: epNone, source: osFallback)
         state.sim.setRoundOrders(orders)
         if state.capture != nil:
           for slot in 0 ..< Seats:
@@ -415,15 +416,23 @@ proc websocketHandler(websocket: WebSocket, event: WebSocketEvent,
         return
       try:
         let payload = parseJson(message.data)
+        if payload.kind != JObject:
+          raise newException(FruitMarketError, "player frame must be a JSON object")
         if payload{"type"}.getStr() == "register" and
             payload{"control"}.getStr() == "external":
           withLock stateLock:
             state.external[slot] = true
+            state.scripted[slot] = skNone
             state.registered[slot] = true
           echo "fruit-market: slot ", slot, " registered an external policy"
           return
         if payload{"type"}.getStr() == "order":
-          let round = payload["round"].getInt()
+          let roundNode = payload{"round"}
+          if roundNode.isNil or roundNode.kind != JInt:
+            raise newException(FruitMarketError, "order frame requires integer round")
+          if not payload.hasKey("order"):
+            raise newException(FruitMarketError, "order frame requires order object")
+          let round = roundNode.getInt()
           withLock stateLock:
             if state.external[slot] and state.started and
                 not state.sim.done and state.sim.roundOf() == round and
@@ -439,14 +448,19 @@ proc websocketHandler(websocket: WebSocket, event: WebSocketEvent,
           echo "fruit-market: ignoring player frame of type ",
             payload{"type"}.getStr()
           return
-        var prompt = payload{"prompt"}.getStr()
+        let promptNode = payload{"prompt"}
+        if not promptNode.isNil and promptNode.kind notin {JNull, JString}:
+          raise newException(FruitMarketError, "prompt must be a string")
+        var prompt = if promptNode.isNil or promptNode.kind == JNull: "" else: promptNode.getStr()
         if prompt.runeLen > MaxPromptLen:
           prompt = prompt.runeSubStr(0, MaxPromptLen)
         let node = payload{"scripted"}
         let kind =
-          if node.isNil: skNone
-          elif node.kind == JBool: (if node.getBool(): skHauler else: skNone)
-          else: parseScriptKind(node.getStr())
+          if node.isNil or node.kind == JNull: skNone
+          elif node.kind == JString: parseScriptKind(node.getStr())
+          else:
+            raise newException(FruitMarketError,
+              "scripted must be a string: " & $node)
         var firstTime = false
         withLock stateLock:
           firstTime = not state.registered[slot]
@@ -469,13 +483,13 @@ proc websocketHandler(websocket: WebSocket, event: WebSocketEvent,
           state.socketSlots.del(websocket)
           if state.playerSockets.getOrDefault(slot) == websocket:
             state.playerSockets.del(slot)
-            ## A seat whose socket DIES MID-EPISODE plays `hauler` for every
-            ## remaining round: decideAll gates on `connected`, so leaving it
-            ## set kept spending the operator's credentials on a prompt whose
-            ## process is gone.
+            ## A non-scripted seat whose socket dies mid-episode takes the
+            ## passive rest/no-eat fallback for every remaining round: decideAll
+            ## gates on `connected`, so leaving it set would keep spending
+            ## credentials on a gone process.
             state.connected[slot] = false
             echo "fruit-market: player slot ", slot,
-              " disconnected; playing hauler for the rest of the episode"
+              " disconnected; resting (fallback) for the rest of the episode"
         state.globalSockets.excl(websocket)
         state.viewers.del(websocket)
 

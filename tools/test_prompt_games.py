@@ -82,14 +82,16 @@ def play(variant, seed, wording="canonical", prompt_seed=0, numeric=False, text=
                         assert f"PRIVATE-SEAT-{other}" not in messages[1]["content"]
             expected = json.loads(json.dumps(action))
             if text and index == 0:
-                action["job"] = "  " + action["job"].upper() + "  "
-                action["offer"]["give"]["n"] = "100"
-                action["offer"]["want"]["n"] = "-3"
+                action["offer"]["give"]["n"] = 100
+                action["offer"]["want"]["n"] = -3
                 expected["offer"]["give"]["n"] = 6
                 expected["offer"]["want"]["n"] = 1
             trace.append((view, messages[1]["content"], action))
+            raw_response = json.dumps(action)
+            if text and index == 1:
+                raw_response = f"```json\n{raw_response}\n```"
             result = request(
-                {"kind": "step", "decision_id": index, "response": json.dumps(action)}
+                {"kind": "step", "decision_id": index, "response": raw_response}
             )
             assert result["kind"] == "accepted" and result["action"] == expected
             observation = result["observation"]
@@ -137,4 +139,26 @@ for wording, split in ((wording, split) for wording in WORDINGS[-2:]
         result.returncode != 0
         and "held-out wording requires an explicit evaluation split" in result.stderr
     )
-print("40 complete language games; held-out gate PASS", flush=True)
+for bad_reply in (
+    '{"job": "  HARVEST  ", "eat": "any"}',
+    '{"job": "market", "offer": {"give": {"fruit": "apple", "n": "3"}, "want": {"fruit": "banana", "n": 2}}}',
+    'Sure!\n```json\n{"job": "rest"}\n```',
+    '{"job": "rest"}{"job": "harvest"}',
+):
+    result = subprocess.run(
+        [
+            str(BRIDGE),
+            str(ROOT / "coworld_manifest_template.json"),
+            VARIANTS[0],
+            "text",
+        ],
+        input=json.dumps({"kind": "reset", "seed": "17", "players": 8})
+        + "\n"
+        + json.dumps({"kind": "step", "decision_id": 0, "response": bad_reply})
+        + "\n",
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    assert result.returncode != 0, f"expected rejection for {bad_reply!r}"
+print("40 complete language games; held-out and strict-parser gates PASS", flush=True)
