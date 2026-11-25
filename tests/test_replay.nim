@@ -196,32 +196,13 @@ suite "the viewer's display is the recorded state":
     for slot in 0 ..< Seats:
       check replay.results["scores"][slot].getInt() == score[slot]
 
-suite "the forfeit replay is still playable":
-  test "no seat connected: results, and a replay the viewer's parser accepts":
-    ## design note: forfeit is "all zero; results + replay are still written".
-    ## A replay whose `frames` array is empty is one `parseReplay` refuses, so
-    ## the static viewer would set data-replay-error on it instead of showing
-    ## the board nobody turned up to.
-    var config = defaultGameConfig()
-    config.seed = 12
-    var sim = initSim(config)
-    sim.forfeit()
-    let results = sim.resultsJson()
-    check results["reason"].getStr() == "forfeit"
-    check results["ending"].getStr() == "forfeit"
-    for slot in 0 ..< Seats:
-      check results["scores"][slot].getInt() == 0
-    let bytes = $replayJson(sim, results)
-    check validateUtf8(bytes) == -1
-    let replay = parseReplay(bytes)
-    check replay.frames.len == 1
-    check replay.maxTick() == 0
-    check replay.beats[^1].kind == "gameover"
-    let frame = parseJson(buildStateJson(
-      chromeViewOfReplay(replay, 0, false, 1, false, true, newJArray())))
-    check frame["ph"].getStr() == "gameover"
-    check frame["over"]["ending"].getStr() == "FORFEIT"
-    check frame["roster"].len == Seats
+suite "incomplete rosters":
+  test "a missing seat is an infrastructure failure with no score":
+    var sim = initSim(defaultGameConfig())
+    sim.failEpisode("infrastructure", "missing_seat", "required seat did not register", @[0])
+    let diagnostics = sim.failureJson()
+    check diagnostics["failure_category"].getStr() == "infrastructure"
+    check not diagnostics.hasKey("scores")
 
 suite "rune-boundary truncation":
   test "a say and notes of multi-byte runes are cut on rune boundaries":

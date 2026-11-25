@@ -216,21 +216,20 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         break
       sleep(200)
 
-    var anyConnected = false
+    var missingSeats: seq[int]
     withLock stateLock:
       state.started = true
-      for slot in 0 ..< Seats:
-        if state.connected[slot]:
-          anyConnected = true
+      for slot in 0 ..< config.numAgents:
+        if not state.connected[slot] or not state.registered[slot]:
+          missingSeats.add(slot)
       echo "fruit-market: starting with ", state.playerSockets.len, "/",
         config.numAgents, " players connected"
       state.sendPlayerStates()
 
-    if not anyConnected:
-      ## No seat connected within playerConnectTimeoutSeconds: forfeit. All
-      ## scores zero, results + replay are still written.
+    if missingSeats.len > 0:
       withLock stateLock:
-        state.sim.forfeit()
+        state.sim.failEpisode("infrastructure", "missing_seat",
+          "Required seats did not register before the lobby closed", missingSeats)
       finishEpisode(runtimeConfig)
       return
 

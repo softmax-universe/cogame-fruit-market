@@ -115,7 +115,7 @@ suite "the chrome frame":
     check final["ph"].getStr() == "gameover"
     check final.hasKey("over")
     check final["over"]["ending"].getStr() in
-      ["ROUND LIMIT", "FAMINE", "TIME", "FORFEIT"]
+      ["ROUND LIMIT", "FAMINE", "TIME"]
     check final["over"]["winner"].getStr() in ["apple", "banana"]
     check final["over"]["scores"].len == Seats
     check final["over"]["aliases"].len == Seats

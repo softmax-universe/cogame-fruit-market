@@ -366,16 +366,6 @@ proc endEarly*(sim: var Sim) =
   ## the game broke.
   sim.finish("deadline", "deadline")
 
-proc forfeit*(sim: var Sim) =
-  ## Nobody connected inside playerConnectTimeoutSeconds. Scores are all zero
-  ## and the artifacts are still written — and the replay is still PLAYABLE:
-  ## record the opening state, because a replay with an empty `frames` array is
-  ## one `parseReplay` refuses ("replay carries no frames"), which is a viewer
-  ## that reports data-replay-error instead of showing the forfeited board.
-  if sim.frames.len == 0:
-    sim.recordFrame()
-  sim.finish("forfeit", "forfeit")
-
 proc failEpisode*(sim: var Sim, category, cause, detail: string,
     failedSeats: openArray[int] = []) =
   ## Terminate an unfinished episode due to an infrastructure/provider failure,

@@ -18,8 +18,8 @@ type
     round*: int              ## rounds completed
     roundsPlayed*: int
     done*: bool
-    reason*: string          ## complete | deadline | forfeit | failed
-    ending*: string          ## round_limit | famine | deadline | forfeit | <failure_cause>
+    reason*: string          ## complete | deadline | failed
+    ending*: string          ## round_limit | famine | deadline | <failure_cause>
     failed*: bool
     failureCategory*: string ## "" | infrastructure | model_invalid
     failureCause*: string

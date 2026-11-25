@@ -276,7 +276,6 @@ proc overJson*(results: JsonNode, names, policyNames: array[Seats, string],
       case ending
       of "famine": "FAMINE"
       of "deadline": "TIME"
-      of "forfeit": "FORFEIT"
       else: "ROUND LIMIT"),
     "winnerAlias": names[bestSlot],
     "winnerPolicy": policyNames[bestSlot],
