@@ -51,9 +51,12 @@ An external player registers with `{"type":"register","control":"external"}`.
 The game sends a `state` frame for each round, containing its existing
 seat-private observation. The player replies with
 `{"type":"order","round":R,"order":{...}}`, using the standing-order schema
-below. The game parses that order, applies the same rules as prompt orders,
-and falls back to a passive `rest` (`eat: none`) order if the external player
-misses the round deadline or submits no valid order.
+below. The game parses that order and applies the same strict rules as prompt
+orders. If a prompt seat hits missing credentials, a provider/transport error,
+timeout, disconnect, or exhausted invalid replies after one retry — or if an
+external seat disconnects or submits no valid order before the round deadline —
+the game terminates the unfinished episode as failed with recorded diagnostics
+and emits no authoritative gameplay scores or winners.
 
 ## The standing order
 

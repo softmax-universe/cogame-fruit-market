@@ -376,6 +376,28 @@ proc forfeit*(sim: var Sim) =
     sim.recordFrame()
   sim.finish("forfeit", "forfeit")
 
+proc failEpisode*(sim: var Sim, category, cause, detail: string,
+    failedSeats: openArray[int] = []) =
+  ## Terminate an unfinished episode due to an infrastructure/provider failure,
+  ## disconnect/timeout, or exhausted invalid model/external action. No
+  ## authoritative gameplay scores or winners are emitted.
+  if sim.done:
+    return
+  if sim.frames.len == 0:
+    sim.recordFrame()
+  sim.failed = true
+  sim.failureCategory = category
+  sim.failureCause = cause
+  sim.failureDetail = cleanText(detail, MaxErrorLen)
+  sim.failedSeats = @failedSeats
+  sim.done = true
+  sim.reason = "failed"
+  sim.ending = (if cause.len > 0: cause else: "error")
+  let terminal = max(0, sim.tick - 1)
+  sim.events.add(SimEvent(kind: evEnd, t: terminal, reason: sim.reason,
+    ending: sim.ending, scores: @[]))
+  sim.beats.add(Beat(t: terminal, kind: "gameover", n: 0, seat: -1))
+
 proc runRound*(sim: var Sim) =
   ## Steps one whole round and closes it. The caller supplies the standing
   ## orders before calling.

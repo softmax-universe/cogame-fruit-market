@@ -7,12 +7,13 @@
 ## Decisions within a round are SIMULTANEOUS by rule, so all eight seats'
 ## requests go out as ONE parallel batch (`curly.makeRequests`) — never
 ## sequentially and never one seat at a time. An invalid reply is retried once,
-## in the same round's retry batch, with a hint; anything still failing falls
-## back to a passive rest/no-eat order and is recorded `"source":"fallback"`.
+## in the same round's retry batch, with a hint; anything still failing returns
+## an explicit seat failure so the server closes the unfinished episode unscored
+## rather than substituting a fake move.
 ##
 ## Credentials, in order: Bedrock sidecar -> ANTHROPIC_API_KEY ->
 ## ANTHROPIC_API_KEY_URI. With none the client disables itself immediately and
-## prompt seats take the passive rest/no-eat fallback (scripted seats still run
+## any prompt seat fails with `missing_credentials` (scripted seats still run
 ## their configured baseline).
 
 import
@@ -32,6 +33,28 @@ const
     "eat values, and offer quantities between 1 and 6."
 
 type
+  LlmInfraError* = object of FruitMarketError
+    cause*: string
+
+  LlmModelError* = object of FruitMarketError
+    cause*: string
+
+  DecisionFailureKind* = enum
+    dfkNone
+    dfkInfrastructure
+    dfkModelInvalid
+
+  SeatFailure* = object
+    slot*: int
+    kind*: DecisionFailureKind
+    cause*: string
+    detail*: string
+
+  DecisionBatchResult* = object
+    orders*: array[Seats, Order]
+    decided*: array[Seats, bool]
+    failures*: seq[SeatFailure]
+
   LlmTransport = enum
     ltNone, ltSidecar, ltBedrock, ltAnthropic
 
@@ -48,6 +71,15 @@ type
     maxOutputTokens: int
     timeoutSeconds: int
     disabled*: bool
+
+proc ok*(res: DecisionBatchResult): bool =
+  res.failures.len == 0
+
+proc categoryName*(kind: DecisionFailureKind): string =
+  case kind
+  of dfkNone: ""
+  of dfkInfrastructure: "infrastructure"
+  of dfkModelInvalid: "model_invalid"
 
 proc bedrockModelIds(): seq[string] =
   ## HAIKU ONLY (raid 2026-08-23, reconfirmed paintball 2026-08-25): the sonnet
@@ -112,7 +144,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "fruit-market llm: no LLM credentials; prompt seats rest (fallback)"
+    echo "fruit-market llm: no LLM credentials; prompt seats will fail without fallback"
 
 # ---- the observation --------------------------------------------------------
 
@@ -612,35 +644,52 @@ proc requestFor(client: LlmClient, system, user: string, slot: int):
   result.headers = headers
   result.body = $body
 
+proc newInfraError(cause, msg: string): ref LlmInfraError =
+  result = newException(LlmInfraError, msg)
+  result.cause = cause
+
+proc newModelError(cause, msg: string): ref LlmModelError =
+  result = newException(LlmModelError, msg)
+  result.cause = cause
+
 proc textOfBody*(body: string): string =
   ## The text of a 2xx reply. A refusal and a `max_tokens` stop before any `{`
   ## both raise BY NAME — the max_tokens signature otherwise shows up as the
   ## misleading "unbalanced JSON object" (hanabi, 2026-08-24).
-  let payload = parseJson(body)
+  var payload: JsonNode
+  try:
+    payload = parseJson(body)
+  except JsonParsingError as error:
+    raise newInfraError("provider_invalid_response",
+      "llm invalid JSON envelope: " & utf8Snippet(error.msg, 160))
   if payload{"stop_reason"}.getStr() == "refusal":
-    raise newException(FruitMarketError, "llm refusal")
+    raise newModelError("model_refusal", "llm refusal")
   let content = payload{"content"}
   if not content.isNil and content.kind == JArray:
     for contentBlock in content:
       if contentBlock{"type"}.getStr() == "text":
         result.add(contentBlock{"text"}.getStr())
   if payload{"stop_reason"}.getStr() == "max_tokens" and '{' notin result:
-    raise newException(FruitMarketError,
+    raise newModelError("model_max_tokens",
       "reply cut off at max_tokens mid-JSON: " & utf8Snippet(result, 160))
 
 proc textOf(client: LlmClient, response: Response, error, url: string): string =
   if error.len > 0:
-    raise newException(FruitMarketError, "llm transport: " & error)
+    let lower = error.toLowerAscii()
+    let cause =
+      if "timeout" in lower or "timed out" in lower: "provider_timeout"
+      else: "provider_transport_error"
+    raise newInfraError(cause, "llm transport: " & error)
   if response.code == 401 or response.code == 403:
     client.disabled = true
-    raise newException(FruitMarketError, "llm auth failed (" & $response.code &
-      "): " & utf8Snippet(response.body, 300))
+    raise newInfraError("provider_auth_error", "llm auth failed (" &
+      $response.code & "): " & utf8Snippet(response.body, 300))
   if response.code == 429:
-    raise newException(FruitMarketError, "llm throttled (429): " &
+    raise newInfraError("provider_rate_limit", "llm throttled (429): " &
       utf8Snippet(response.body, 200))
   if response.code < 200 or response.code >= 300:
-    raise newException(FruitMarketError, "llm error " & $response.code & ": " &
-      utf8Snippet(response.body, 200))
+    raise newInfraError("provider_http_error", "llm error " & $response.code &
+      ": " & utf8Snippet(response.body, 200))
   textOfBody(response.body)
 
 # ---- the reply schema --------------------------------------------------------
@@ -798,11 +847,13 @@ proc decideAll*(
   scripted: array[Seats, ScriptKind],
   connected: array[Seats, bool],
   selection: PromptSelection,
-  capture: RuntimeCapture = nil
-): array[Seats, Order] =
-  ## One standing order per seat. NEVER raises: any failed or disconnected
-  ## non-scripted seat falls back to a passive rest/no-eat order so the episode
-  ## always advances without inserting a scripted strategy.
+  capture: RuntimeCapture = nil,
+  external: array[Seats, bool] = default(array[Seats, bool])
+): DecisionBatchResult =
+  ## One standing order per seat. NEVER substitutes a fake move: any failed,
+  ## disconnected, or uncredentialed prompt seat is returned in `result.failures`
+  ## with its classified cause so the server terminates the unfinished episode
+  ## unscored.
   if capture != nil:
     var observations: seq[JsonNode]
     for slot in 0 ..< Seats:
@@ -814,12 +865,32 @@ proc decideAll*(
   for slot in 0 ..< Seats:
     let kind = scripted[slot]
     if kind != skNone:
-      result[slot] = scriptedOrder(sim, slot, kind)
-    elif client.disabled or not connected[slot]:
-      result[slot] = Order(job: jRest, eat: epNone, source: osFallback)
+      result.orders[slot] = scriptedOrder(sim, slot, kind)
+      result.decided[slot] = true
+    elif external[slot]:
+      ## External seats supply their own standing orders through /player.
+      discard
+    elif not connected[slot]:
+      result.failures.add(SeatFailure(
+        slot: slot,
+        kind: dfkInfrastructure,
+        cause: "player_disconnected",
+        detail: "seat " & $slot & " is not connected"
+      ))
+    elif client.disabled:
+      result.failures.add(SeatFailure(
+        slot: slot,
+        kind: dfkInfrastructure,
+        cause: "missing_credentials",
+        detail: "no LLM credentials configured for prompt seat " & $slot
+      ))
     else:
       open.add(slot)
 
+  if result.failures.len > 0:
+    return
+
+  var lastFailure: array[Seats, SeatFailure]
   for attempt in 0 .. 1:
     if open.len == 0 or client.disabled:
       break
@@ -849,12 +920,34 @@ proc decideAll*(
           evidence.accepted = proposal == order.orderJson()
           if not evidence.accepted:
             evidence.rejectionReason = some("native parser normalized proposal")
-        result[slot] = order
+        result.orders[slot] = order
+        result.decided[slot] = true
+      except LlmInfraError as error:
+        let reason = utf8Snippet(error.msg, MaxErrorLen)
+        if capture != nil: evidence.rejectionReason = some(reason)
+        echo "fruit-market llm: seat ", slot, " attempt ", attempt,
+          " infra failure (", error.cause, "): ", reason
+        lastFailure[slot] = SeatFailure(
+          slot: slot, kind: dfkInfrastructure,
+          cause: error.cause, detail: reason)
+        stillOpen.add(slot)
+      except LlmModelError as error:
+        let reason = utf8Snippet(error.msg, MaxErrorLen)
+        if capture != nil: evidence.rejectionReason = some(reason)
+        echo "fruit-market llm: seat ", slot, " attempt ", attempt,
+          " model failure (", error.cause, "): ", reason
+        lastFailure[slot] = SeatFailure(
+          slot: slot, kind: dfkModelInvalid,
+          cause: error.cause, detail: reason)
+        stillOpen.add(slot)
       except CatchableError as error:
         let reason = utf8Snippet(error.msg, MaxErrorLen)
         if capture != nil: evidence.rejectionReason = some(reason)
         echo "fruit-market llm: seat ", slot, " attempt ", attempt,
-          " failed: ", reason
+          " invalid order: ", reason
+        lastFailure[slot] = SeatFailure(
+          slot: slot, kind: dfkModelInvalid,
+          cause: "model_invalid_action", detail: reason)
         stillOpen.add(slot)
       if capture != nil:
         capture.recordAttempt(slot, evidence, selection.promptMetadata(
@@ -863,5 +956,6 @@ proc decideAll*(
     open = stillOpen
 
   for slot in open:
-    echo "fruit-market llm: seat ", slot, " falling back to rest order"
-    result[slot] = Order(job: jRest, eat: epNone, source: osFallback)
+    echo "fruit-market llm: seat ", slot, " failed (",
+      lastFailure[slot].cause, "): ", lastFailure[slot].detail
+    result.failures.add(lastFailure[slot])

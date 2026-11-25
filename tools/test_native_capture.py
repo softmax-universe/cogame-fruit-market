@@ -101,7 +101,8 @@ def _market_offer_for_farm(farm: str) -> dict[str, object]:
 
 
 def _run_external_malformed_then_valid_seat(
-    host: str, port: int, slot: int, token: str, summary_out: dict[str, int]
+    host: str, port: int, slot: int, token: str, summary_out: dict[str, int],
+    *, drop_round: int | None = None
 ) -> None:
     sock, buf = _ws_connect(host, port, f"/player?slot={slot}&token={token}")
     try:
@@ -129,6 +130,9 @@ def _run_external_malformed_then_valid_seat(
                     continue
                 submitted_rounds.add(round_no)
                 farm = msg["you"]["farmType"]
+                if drop_round is not None and round_no == drop_round:
+                    # Deliberately omit any order for this round to test external_timeout failure.
+                    continue
                 # First send malformed fruit & null order frames through the live /player socket;
                 # the server must reject both without crashing and without latching orderReceived.
                 _ws_send_text(
@@ -151,9 +155,6 @@ def _run_external_malformed_then_valid_seat(
                     json.dumps({"type": "order", "round": round_no, "order": None}),
                 )
                 summary_out["malformed_sent"] += 2
-                if round_no == 6:
-                    # Leave round 6 without a valid order to verify passive rest fallback (never hauler).
-                    continue
                 if round_no % 2 == 1:
                     valid_order: dict[str, object] = {
                         "job": "harvest",
@@ -235,7 +236,9 @@ def _malformed_fruit_reply(slot: int, content: str) -> bytes:
                 "job": "market",
                 "stall": "north",
                 "eat": "crave",
-                "offer": {"give": {"fruit": None, "n": 3}, "want": {"fruit": "banana", "n": 2}},
+                "offer": _market_offer_for_farm(farm),
+                "say": "retry-ok-1",
+                "notes": "recovered",
             }
         )
     if round_no == 3:
@@ -249,14 +252,7 @@ def _malformed_fruit_reply(slot: int, content: str) -> bytes:
                         "offer": {"give": {"fruit": "apple"}, "want": {"fruit": "banana", "n": 2}},
                     }
                 )
-            return wrap(
-                {
-                    "job": "market",
-                    "stall": "east",
-                    "eat": "crave",
-                    "offer": {"give": {"fruit": "apple", "n": 3}, "want": {"fruit": "banana"}},
-                }
-            )
+            return wrap({"job": "harvest", "eat": "any", "say": "r3-ok", "notes": "recovered"})
         if not is_retry:
             return wrap(
                 {
@@ -269,7 +265,7 @@ def _malformed_fruit_reply(slot: int, content: str) -> bytes:
                     },
                 }
             )
-        return wrap({"job": "harvest", "fruit": 123, "eat": "any", "say": "bad", "notes": "bad"})
+        return wrap({"job": "harvest", "eat": "any", "say": "r3-ok-1", "notes": "recovered"})
     if round_no == 4:
         if slot == 0:
             if not is_retry:
@@ -315,18 +311,15 @@ def _malformed_fruit_reply(slot: int, content: str) -> bytes:
             }
         ).encode()
     if round_no == 6 and slot == 0:
-        bad_text = (
-            'Sure! {"job": "harvest", "eat": "any"}'
-            if not is_retry
-            else '{"job": "rest"}{"job": "harvest"}'
-        )
-        return json.dumps(
-            {
-                "model": "loopback-fixture",
-                "stop_reason": "end_turn",
-                "content": [{"type": "text", "text": bad_text}],
-            }
-        ).encode()
+        if not is_retry:
+            return json.dumps(
+                {
+                    "model": "loopback-fixture",
+                    "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": 'Sure! {"job": "harvest", "eat": "any"}'}],
+                }
+            ).encode()
+        return wrap({"job": "harvest", "eat": "any", "say": "prose-retry-ok", "notes": "ok"})
     if round_no % 2 == 1:
         return wrap({"job": "harvest", "eat": "any", "say": f"r{round_no}", "notes": "ok"})
     return wrap(
@@ -348,7 +341,16 @@ def main() -> None:
     parser.add_argument("output", type=Path)
     parser.add_argument(
         "--mode",
-        choices=("accepted", "invalid", "429", "normalized", "malformed-fruit"),
+        choices=(
+            "accepted",
+            "invalid",
+            "ambiguous",
+            "429",
+            "no-credentials",
+            "external-timeout",
+            "normalized",
+            "malformed-fruit",
+        ),
         default="accepted",
     )
     parser.add_argument("--seed", type=int, default=1)
@@ -374,6 +376,21 @@ def main() -> None:
                 if args.mode == "malformed-fruit":
                     body = _malformed_fruit_reply(slot_no, request["messages"][0]["content"])
                     status = 200
+                elif args.mode == "ambiguous":
+                    is_retry = "Your previous reply was invalid." in request["messages"][0]["content"]
+                    bad_text = (
+                        'Sure! {"job": "harvest", "eat": "any"}'
+                        if not is_retry
+                        else '{"job": "rest"}{"job": "harvest"}'
+                    )
+                    body = json.dumps(
+                        {
+                            "model": "loopback-fixture",
+                            "stop_reason": "end_turn",
+                            "content": [{"type": "text", "text": bad_text}],
+                        }
+                    ).encode()
+                    status = 200
                 else:
                     order = {
                         "job": "harvest",
@@ -385,11 +402,14 @@ def main() -> None:
                         order["job"] = "not-a-native-job"
                     elif args.mode == "normalized":
                         order["notes"] = "local\rnormalized"
+                    text = json.dumps(order)
+                    if args.mode == "accepted" and slot_no == 1:
+                        text = f"```json\n{text}\n```"
                     body = json.dumps(
                         {
                             "model": "loopback-fixture",
                             "stop_reason": "end_turn",
-                            "content": [{"type": "text", "text": json.dumps(order)}],
+                            "content": [{"type": "text", "text": text}],
                         }
                     ).encode()
                     status = 429 if args.mode == "429" else 200
@@ -427,7 +447,7 @@ def main() -> None:
         "players": [{"name": f"fixture-{s}"} for s in range(8)],
         "rounds": 12,
         "minTurnSeconds": 0,
-        "llmTimeoutSeconds": 1 if args.mode == "malformed-fruit" else 20,
+        "llmTimeoutSeconds": 1 if args.mode in ("malformed-fruit", "external-timeout") else 20,
         "playerConnectTimeoutSeconds": 10,
         "shutdownGraceSeconds": 0,
     }
@@ -439,6 +459,7 @@ def main() -> None:
         COGAME_PORT=str(port),
         COGAME_CONFIG_URI=(output / "config.json").as_uri(),
         COGAME_RESULTS_URI=(output / "results.json").as_uri(),
+        COGAME_PLAYER_FAILURE_URI=(output / "player_failure.json").as_uri(),
         COGAME_SAVE_REPLAY_URI=(output / "replay.json").as_uri(),
         COGAME_SAVE_TRAJECTORY_URI=(output / "trajectory.jsonl").as_uri(),
         COWORLD_EPISODE_ID="fixture-only-not-a-hosted-episode",
@@ -447,6 +468,9 @@ def main() -> None:
         COWORLD_LLM_ENDPOINT=f"http://127.0.0.1:{fixture.server_port}",
         COWORLD_LLM_MODEL="loopback-fixture",
     )
+    if args.mode == "no-credentials":
+        del env["COWORLD_LLM_ENDPOINT"]
+        del env["COWORLD_LLM_MODEL"]
     if args.no_capture:
         del env["COGAME_SAVE_TRAJECTORY_URI"]
     processes, logs = [], []
@@ -472,10 +496,11 @@ def main() -> None:
                 assert time.monotonic() < deadline, "Game never became healthy"
                 time.sleep(0.05)
         for seat in range(8):
-            if args.mode == "malformed-fruit" and seat == 2:
+            if args.mode in ("malformed-fruit", "external-timeout") and seat == 2:
                 external_thread = threading.Thread(
                     target=_run_external_malformed_then_valid_seat,
                     args=("127.0.0.1", port, 2, "token-2", external_summary),
+                    kwargs={"drop_round": 1 if args.mode == "external-timeout" else None},
                 )
                 external_thread.start()
                 continue
@@ -495,7 +520,12 @@ def main() -> None:
                     stderr=subprocess.STDOUT,
                 )
             )
-        assert game.wait(timeout=60) == 0
+        expect_failure = args.mode in ("invalid", "ambiguous", "429", "no-credentials", "external-timeout")
+        game_rc = game.wait(timeout=60)
+        if expect_failure:
+            assert game_rc != 0, f"expected non-zero exit for mode={args.mode}, got {game_rc}"
+        else:
+            assert game_rc == 0, f"expected exit 0 for mode={args.mode}, got {game_rc}"
         for process in processes[1:]:
             assert process.wait(timeout=5) == 0
         if external_thread is not None:
@@ -511,10 +541,63 @@ def main() -> None:
         fixture.shutdown()
         fixture.server_close()
         (output / "fixture-calls.json").write_text(json.dumps(calls, indent=2) + "\n")
-    results = json.loads((output / "results.json").read_text())
-    assert results["reason"] == "complete" and results["rounds"] == 12, results
     assert canary not in (output / "replay.json").read_text()
     trajectory = output / "trajectory.jsonl"
+    if expect_failure:
+        assert not (output / "results.json").exists(), "failed episode must not emit numeric results.json"
+        failure = json.loads((output / "player_failure.json").read_text())
+        assert failure["reason"] == "failed", failure
+        assert "scores" not in failure and "win" not in failure, failure
+        if args.mode in ("invalid", "ambiguous"):
+            assert failure["failure_category"] == "model_invalid", failure
+            assert failure["failure_cause"] == "model_invalid_action", failure
+            expected_action_status = "rejected"
+            expected_calls = 4
+        elif args.mode == "429":
+            assert failure["failure_category"] == "infrastructure", failure
+            assert failure["failure_cause"] == "provider_rate_limit", failure
+            expected_action_status = "missing"
+            expected_calls = 4
+        elif args.mode == "no-credentials":
+            assert failure["failure_category"] == "infrastructure", failure
+            assert failure["failure_cause"] == "missing_credentials", failure
+            expected_action_status = "missing"
+            expected_calls = 0
+        elif args.mode == "external-timeout":
+            assert failure["failure_category"] == "infrastructure", failure
+            assert failure["failure_cause"] == "external_timeout", failure
+            expected_action_status = "missing"
+            expected_calls = 2
+        assert len(calls) == expected_calls, (len(calls), expected_calls)
+        if not args.no_capture:
+            assert trajectory.is_file(), "Failed episode did not retain its private trajectory"
+            events = [json.loads(line) for line in trajectory.read_bytes().decode("utf-8").splitlines()]
+            assert events[-1]["event_type"] == "episode" and events[-1]["status"] == "failed", events[-1]
+            assert events[-1]["participant_outcomes"] is None, events[-1]
+            assert "scores" not in events[-1]["outcome"] and "win" not in events[-1]["outcome"], events[-1]["outcome"]
+            decisions = events[:-1]
+            assert len(decisions) >= 1
+            for d in decisions:
+                assert d["action_status"] == expected_action_status, d
+                assert d["executed_action"] is None, d
+                assert d["selected_attempt_id"] is None, d
+                assert d["terminal"] is True, d
+        print(
+            json.dumps(
+                {
+                    "mode": args.mode,
+                    "failed": True,
+                    "failure_category": failure["failure_category"],
+                    "failure_cause": failure["failure_cause"],
+                    "fixture_calls": len(calls),
+                    "fixture_only": True,
+                }
+            )
+        )
+        return
+    assert not (output / "player_failure.json").exists(), "completed episode must not write player_failure.json"
+    results = json.loads((output / "results.json").read_text())
+    assert results["reason"] == "complete" and results["rounds"] == 12, results
     if args.no_capture:
         assert not trajectory.exists()
         print(
@@ -534,7 +617,7 @@ def main() -> None:
     decisions = events[:-1]
     assert len(decisions) == 96
     actual = [a for d in decisions for a in d["attempts"] if a["origin"] == "model"]
-    expected_calls = 31 if args.mode == "malformed-fruit" else 24 if args.mode in ("accepted", "normalized") else 48
+    expected_calls = 31 if args.mode == "malformed-fruit" else 24
     assert len(actual) == len(calls) == expected_calls, (len(actual), len(calls), expected_calls)
     received = {c["id"]: c for c in calls}
     for attempt in actual:
@@ -545,7 +628,7 @@ def main() -> None:
     if args.mode == "malformed-fruit":
         assert external_summary == {
             "malformed_sent": 24,
-            "valid_sent": 11,
+            "valid_sent": 12,
             "saw_final": 1,
         }, external_summary
         assert results["total_trades"] > 0, results
@@ -555,21 +638,21 @@ def main() -> None:
         assert r2s0["action_status"] == "accepted"
         assert r2s0["selected_attempt_id"].endswith("-1")
         assert "missing fruit in offer.give.fruit" in r2s0["attempts"][0]["rejection_reason"]
-        # Round 2 seat 1: missing offer.want.fruit then null offer.give.fruit -> deterministic fallback
+        # Round 2 seat 1: missing offer.want.fruit -> recovered on retry attempt 1
         r2s1 = by_round_seat[(2, 1)]
-        assert r2s1["action_status"] == "fallback"
+        assert r2s1["action_status"] == "accepted"
+        assert r2s1["selected_attempt_id"].endswith("-1")
         assert "missing fruit in offer.want.fruit" in r2s1["attempts"][0]["rejection_reason"]
-        assert "unknown fruit in offer.give.fruit: null" in r2s1["attempts"][1]["rejection_reason"]
-        # Round 3 seat 0: missing offer.give.n then missing offer.want.n -> deterministic fallback
+        # Round 3 seat 0: missing offer.give.n -> recovered on retry attempt 1
         r3s0 = by_round_seat[(3, 0)]
-        assert r3s0["action_status"] == "fallback"
+        assert r3s0["action_status"] == "accepted"
+        assert r3s0["selected_attempt_id"].endswith("-1")
         assert "missing offer.give.n" in r3s0["attempts"][0]["rejection_reason"]
-        assert "missing offer.want.n" in r3s0["attempts"][1]["rejection_reason"]
-        # Round 3 seat 1: non-string offer.give.fruit then non-string top-level fruit -> fallback
+        # Round 3 seat 1: non-string offer.give.fruit -> recovered on retry attempt 1
         r3s1 = by_round_seat[(3, 1)]
-        assert r3s1["action_status"] == "fallback"
+        assert r3s1["action_status"] == "accepted"
+        assert r3s1["selected_attempt_id"].endswith("-1")
         assert "unknown fruit in offer.give.fruit:" in r3s1["attempts"][0]["rejection_reason"]
-        assert "unknown fruit in fruit: 123" in r3s1["attempts"][1]["rejection_reason"]
         # Round 4 seat 0: empty 200 envelope {} -> recovered on retry with legal null offer withdrawal
         r4s0 = by_round_seat[(4, 0)]
         assert r4s0["action_status"] == "accepted"
@@ -591,21 +674,17 @@ def main() -> None:
         assert r5s1["action_status"] == "accepted"
         assert r5s1["selected_attempt_id"].endswith("-0")
         assert r5s1["executed_action"]["say"] == "fenced-ok"
-        # Round 6 seat 0: prose-wrapped JSON then extra JSON objects -> passive rest/no-eat fallback
+        # Round 6 seat 0: prose-wrapped JSON rejected on attempt 0 -> recovered on retry attempt 1
         r6s0 = by_round_seat[(6, 0)]
-        assert r6s0["action_status"] == "fallback"
-        assert r6s0["executed_action"] == {"job": "rest", "eat": "none", "say": "", "notes": ""}
-        # Seat 2 (external player): 11 rounds accepted valid external orders; round 6 missed -> passive rest fallback
+        assert r6s0["action_status"] == "accepted"
+        assert r6s0["selected_attempt_id"].endswith("-1")
+        assert r6s0["executed_action"]["say"] == "prose-retry-ok"
+        # Seat 2 (external player): all 12 rounds accepted valid external orders after rejecting malformed frames
         for r in range(1, 13):
             d_ext = by_round_seat[(r, 2)]
-            if r == 6:
-                assert d_ext["action_status"] == "fallback"
-                assert d_ext["executed_action"] == {"job": "rest", "eat": "none", "say": "", "notes": ""}
-                assert d_ext["fallback_origin"] == "engine-fruit-market-fallback"
-            else:
-                assert d_ext["action_status"] == "accepted"
-                assert d_ext["attempts"][0]["origin"] == "unknown"
-                assert d_ext["executed_action"]["notes"] == f"ext-{r}"
+            assert d_ext["action_status"] == "accepted"
+            assert d_ext["attempts"][0]["origin"] == "unknown"
+            assert d_ext["executed_action"]["notes"] == f"ext-{r}"
         # Seats 3..7: scripted hauler teacher
         for r in range(1, 13):
             for s in range(3, 8):
@@ -622,7 +701,7 @@ def main() -> None:
                 continue
             selected = next(a for a in decision["attempts"] if a["attempt_id"] == decision["selected_attempt_id"])
             assert selected["accepted"] and selected["parsed_action"] == decision["executed_action"]
-            origin = "teacher" if int(decision["seat"]) >= 2 else "model" if args.mode == "accepted" else "fallback"
+            origin = "teacher" if int(decision["seat"]) >= 2 else "model"
             assert selected["origin"] == origin
     print(
         json.dumps(

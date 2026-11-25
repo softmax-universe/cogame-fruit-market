@@ -40,6 +40,7 @@ type
     scripted: array[Seats, ScriptKind]
     external: array[Seats, bool]
     externalOrders: array[Seats, Order]
+    externalErrors: array[Seats, seq[string]]
     orderReceived: array[Seats, bool]
     registered: array[Seats, bool]
     connected: array[Seats, bool]
@@ -128,12 +129,14 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
     results: JsonNode
     replayData: string
     grace = 20
+    failed = false
   withLock stateLock:
     if state.finished:
       return
     state.finished = true
     grace = state.config.shutdownGraceSeconds
-    results = state.sim.resultsJson()
+    failed = state.sim.failed
+    results = if failed: state.sim.failureJson() else: state.sim.resultsJson()
     replayData = $replayJson(state.sim, results)
     ## Send final frames to players BEFORE writing artifacts: the hosted
     ## worker tears player pods down as soon as results.json exists.
@@ -143,24 +146,37 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
     var final = %*{
       "type": "final",
       "done": true,
-      "scores": results["scores"],
       "names": aliases,
       "rounds": results["rounds"],
       "reason": results["reason"],
       "ending": results["ending"]
     }
+    if not failed:
+      final["scores"] = results["scores"]
+    else:
+      final["failure_category"] = results["failure_category"]
+      final["failure_cause"] = results["failure_cause"]
+      final["failure_detail"] = results["failure_detail"]
     for slot, socket in state.playerSockets:
       final["slot"] = %slot
       socket.send($final)
     state.broadcastLocked()
 
   sleep(500)
-  echo "fruit-market: writing results and replay"
   state.capture.finishCapture(results)
-  writeArtifact(runtimeConfig.resultsUri, $results, "application/json",
-    "COGAME_RESULTS_METHOD")
-  writeArtifact(runtimeConfig.replayUri, replayData, "application/json",
-    "COGAME_SAVE_REPLAY_METHOD")
+  if failed:
+    echo "fruit-market: episode failed (", results["failure_category"].getStr(),
+      " / ", results["failure_cause"].getStr(), "); omitting numeric results"
+    writeArtifact(getEnv("COGAME_PLAYER_FAILURE_URI").strip(), $results,
+      "application/json", "COGAME_PLAYER_FAILURE_METHOD")
+    writeArtifact(runtimeConfig.replayUri, replayData, "application/json",
+      "COGAME_SAVE_REPLAY_METHOD")
+  else:
+    echo "fruit-market: writing results and replay"
+    writeArtifact(runtimeConfig.resultsUri, $results, "application/json",
+      "COGAME_RESULTS_METHOD")
+    writeArtifact(runtimeConfig.replayUri, replayData, "application/json",
+      "COGAME_SAVE_REPLAY_METHOD")
   ## Hosted certification pings the global websocket AFTER the player pods
   ## start, so /healthz and /global keep answering for a bounded grace before
   ## the process exits (lantern, 2026-08-23).
@@ -169,6 +185,9 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   withLock stateLock:
     state.shuttingDown = true
   sleep(grace * 1000)
+  if failed:
+    echo "fruit-market: episode failed, shutting down"
+    quit(1)
   echo "fruit-market: episode complete, shutting down"
   quit(0)
 
@@ -253,11 +272,6 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         if state.capture != nil: nativeScripts = state.scripted
         connected = state.connected
         external = state.external
-        for slot in 0 ..< Seats:
-          if external[slot]:
-            ## External seats supply their own standing orders; exclude them
-            ## from the server's LLM batch without substituting a scripted policy.
-            connected[slot] = false
 
       ## `minTurnSeconds` floors the spacing between BATCH STARTS, so the
       ## episode issues at most 8 requests / minTurnSeconds — under the Bedrock
@@ -270,45 +284,102 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
 
       ## The slow part (one parallel batch of eight) runs OUTSIDE the lock on a
       ## snapshot; only this thread mutates the sim, so it cannot go stale.
-      var orders = client.decideAll(simCopy, prompts, scripts, connected,
-        state.selection, state.capture)
-      let orderDeadline = lastBatchStart +
-        2.0 * config.llmTimeoutSeconds.float + 2.0
-      while epochTime() < orderDeadline:
-        var allReceived = true
-        withLock stateLock:
-          for slot in 0 ..< Seats:
-            if external[slot] and state.connected[slot] and
-                not state.orderReceived[slot]:
-              allReceived = false
-        if allReceived:
+      var batchResult = client.decideAll(simCopy, prompts, scripts, connected,
+        state.selection, state.capture, external)
+      var hasExternal = false
+      for slot in 0 ..< Seats:
+        if external[slot]:
+          hasExternal = true
           break
-        sleep(20)
+      if batchResult.ok and hasExternal:
+        let orderDeadline = lastBatchStart +
+          2.0 * config.llmTimeoutSeconds.float + 2.0
+        while epochTime() < orderDeadline:
+          var allReceived = true
+          var anyDisconnected = false
+          withLock stateLock:
+            for slot in 0 ..< Seats:
+              if external[slot]:
+                if not state.connected[slot] and not state.orderReceived[slot]:
+                  anyDisconnected = true
+                elif state.connected[slot] and not state.orderReceived[slot]:
+                  allReceived = false
+          if allReceived or anyDisconnected:
+            break
+          sleep(20)
 
       withLock stateLock:
+        var failures = batchResult.failures
+        var orders = batchResult.orders
         for slot in 0 ..< Seats:
           if external[slot]:
             if state.orderReceived[slot]:
               orders[slot] = state.externalOrders[slot]
+              batchResult.decided[slot] = true
+            elif state.externalErrors[slot].len > 0:
+              failures.add(SeatFailure(
+                slot: slot,
+                kind: dfkModelInvalid,
+                cause: "external_invalid_action",
+                detail: state.externalErrors[slot][^1]
+              ))
+            elif not state.connected[slot]:
+              failures.add(SeatFailure(
+                slot: slot,
+                kind: dfkInfrastructure,
+                cause: "player_disconnected",
+                detail: "external seat " & $slot & " disconnected"
+              ))
             else:
-              orders[slot] = Order(job: jRest, eat: epNone, source: osFallback)
+              failures.add(SeatFailure(
+                slot: slot,
+                kind: dfkInfrastructure,
+                cause: "external_timeout",
+                detail: "external seat " & $slot & " missed round deadline"
+              ))
+        if failures.len > 0:
+          var primary = failures[0]
+          for item in failures:
+            if item.kind == dfkInfrastructure:
+              primary = item
+              break
+          var failedSeats: seq[int]
+          for item in failures:
+            failedSeats.add(item.slot)
+            if state.capture != nil:
+              if external[item.slot]:
+                for idx, errMsg in state.externalErrors[item.slot]:
+                  state.capture.recordExternalRejectedAttempt(item.slot,
+                    simCopy.tick, idx, state.sim.policyNames[item.slot], errMsg)
+              let status =
+                if item.kind == dfkModelInvalid: asRejected else: asMissing
+              state.capture.recordFailedDecision(item.slot, simCopy.tick,
+                status, state.sim.policyNames[item.slot], item.detail)
+          state.sim.failEpisode(categoryName(primary.kind), primary.cause,
+            primary.detail, failedSeats)
+          for slot in 0 ..< Seats:
+            state.orderReceived[slot] = false
+            state.externalErrors[slot].setLen(0)
+          state.broadcastLocked()
+          state.sendPlayerStates()
+          break
         state.sim.setRoundOrders(orders)
         if state.capture != nil:
           for slot in 0 ..< Seats:
             let origin = case orders[slot].source
               of osLlm, osRetry: aoModel
               of osExternal: aoUnknown
+              of osScripted: aoTeacher
               of osFallback: aoFallback
-              of osScripted:
-                if nativeScripts[slot] == skNone: aoFallback else: aoTeacher
             state.capture.applied(slot, simCopy.tick,
               state.sim.cogs[slot].order.orderJson(), origin,
               if origin == aoTeacher: "scripted-" & $nativeScripts[slot]
               elif origin == aoUnknown: "external-player"
-              else: "engine-fruit-market-fallback")
+              else: state.sim.policyNames[slot])
         state.sim.runRound()
         for slot in 0 ..< Seats:
           state.orderReceived[slot] = false
+          state.externalErrors[slot].setLen(0)
         echo "fruit-market: round ", state.sim.roundsPlayed, " of ",
           config.rounds, " done at ", (epochTime() - gameStart).int, "s"
         state.broadcastLocked()
@@ -437,12 +508,18 @@ proc websocketHandler(websocket: WebSocket, event: WebSocketEvent,
             if state.external[slot] and state.started and
                 not state.sim.done and state.sim.roundOf() == round and
                 not state.orderReceived[slot]:
-              var order = parseOrder(payload["order"], state.sim, slot)
-              order.source = osExternal
-              state.externalOrders[slot] = order
-              state.orderReceived[slot] = true
-              echo "fruit-market: slot ", slot,
-                " submitted standing order for round ", round
+              try:
+                var order = parseOrder(payload["order"], state.sim, slot)
+                order.source = osExternal
+                state.externalOrders[slot] = order
+                state.orderReceived[slot] = true
+                echo "fruit-market: slot ", slot,
+                  " submitted standing order for round ", round
+              except CatchableError as error:
+                let reason = cleanText(error.msg, MaxErrorLen)
+                state.externalErrors[slot].add(reason)
+                echo "fruit-market: slot ", slot,
+                  " submitted invalid external order for round ", round, ": ", reason
           return
         if payload{"type"}.getStr() != "prompt":
           echo "fruit-market: ignoring player frame of type ",
@@ -483,13 +560,12 @@ proc websocketHandler(websocket: WebSocket, event: WebSocketEvent,
           state.socketSlots.del(websocket)
           if state.playerSockets.getOrDefault(slot) == websocket:
             state.playerSockets.del(slot)
-            ## A non-scripted seat whose socket dies mid-episode takes the
-            ## passive rest/no-eat fallback for every remaining round: decideAll
-            ## gates on `connected`, so leaving it set would keep spending
-            ## credentials on a gone process.
+            ## A non-scripted seat whose socket dies mid-episode causes the
+            ## unfinished episode to fail on its next decision rather than
+            ## silently substituting a passive move.
             state.connected[slot] = false
             echo "fruit-market: player slot ", slot,
-              " disconnected; resting (fallback) for the rest of the episode"
+              " disconnected; episode will fail on next decision for this seat"
         state.globalSockets.excl(websocket)
         state.viewers.del(websocket)
 
