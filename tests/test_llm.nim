@@ -14,6 +14,7 @@ import fruit_market/prompts, fruit_market/sim, fruit_market/scripted, fruit_mark
 type StubMode = enum
   smJunk        ## 200 Messages envelope whose model text is prose with no JSON object
   smBadEnvelope ## 200 non-JSON HTTP body (malformed provider envelope)
+  smUnavailable ## 503
   smThrottle    ## 429
   smForbidden   ## 403
   smSilent      ## answers so late the client's own deadline fires first
@@ -21,6 +22,7 @@ type StubMode = enum
 var
   stubMode: StubMode
   stubPort: int
+  stubRequests: int
   stubListener: Socket
   stubThread: Thread[void]
 
@@ -38,15 +40,18 @@ proc stubAccept() =
         let line = client.recvLine(timeout = 2000)
         if line.len == 0 or line == "\r\n":
           break
+      inc stubRequests
       let body =
         case stubMode
         of smJunk: """{"stop_reason":"end_turn","content":[{"type":"text","text":"I think I will go to the market, but I will not say so in JSON."}]}"""
         of smBadEnvelope: """not valid json at all"""
+        of smUnavailable: """{"type":"error","error":{"type":"service_unavailable"}}"""
         of smThrottle: """{"type":"error","error":{"type":"overloaded"}}"""
         of smForbidden: """{"type":"error","error":{"type":"forbidden"}}"""
         of smSilent: """{"content":[{"type":"text","text":"{}"}]}"""
       let status =
         case stubMode
+        of smUnavailable: "503 Service Unavailable"
         of smThrottle: "429 Too Many Requests"
         of smForbidden: "403 Forbidden"
         else: "200 OK"
@@ -320,27 +325,48 @@ suite "fail explicitly, never substitute fake moves":
       check res.decided[slot]
       check res.orders[slot] == scriptedOrder(game, slot, want)
 
-  test "failEpisode produces unscored failure JSON with no scores or winners":
+  test "failEpisode produces unscored failure JSON and closed GamePlayerFailure JSON":
     var game = bench()
-    game.failEpisode("infrastructure", "provider_rate_limit",
-      "llm throttled (429)", @[0, 1])
+    game.failEpisode("infrastructure", "provider_http_error",
+      "llm error 503: unavailable", @[3, 0])
     check game.done
     check game.failed
     let payload = game.resultsJson()
     check payload["reason"].getStr() == "failed"
-    check payload["ending"].getStr() == "provider_rate_limit"
+    check payload["ending"].getStr() == "provider_http_error"
     check payload["failure_category"].getStr() == "infrastructure"
-    check payload["failure_cause"].getStr() == "provider_rate_limit"
+    check payload["failure_cause"].getStr() == "provider_http_error"
     check not payload.hasKey("scores")
     check not payload.hasKey("win")
+    let pf = game.playerFailureJson()
+    check pf.len == 3
+    check pf["failed_policy_index"].getInt() == 3
+    check pf["kind"].getStr() == "episode_inconclusive"
+    check "provider_http_error" in pf["message"].getStr()
+    check "503" in pf["message"].getStr()
+
+    var invalidGame = bench()
+    invalidGame.failEpisode("model_invalid", "model_invalid_action",
+      "no JSON object in response: not an action", @[5])
+    let pfInvalid = invalidGame.playerFailureJson()
+    check pfInvalid.len == 3
+    check pfInvalid["failed_policy_index"].getInt() == 5
+    check pfInvalid["kind"].getStr() == "player_error"
+    check "model_invalid_action" in pfInvalid["message"].getStr()
+
+    var noSeatGame = bench()
+    noSeatGame.failEpisode("infrastructure", "provider_http_error", "llm error 503", @[])
+    expect FruitMarketError:
+      discard noSeatGame.playerFailureJson()
 
 suite "a stubbed transport fails explicitly with classified causes":
   ## Every one of these routes a REAL request through curly to the stub and
   ## asserts the seat fails with an explicit classified cause (infrastructure vs
-  ## model_invalid) and NEVER substitutes a passive rest or scripted order.
+  ## model_invalid) and NEVER retries or substitutes a passive rest or scripted order.
   proc runAgainstStub(mode: StubMode, openSeats = Seats,
       timeoutSeconds = 1): DecisionBatchResult =
     startStub(mode)
+    stubRequests = 0
     let client = stubClient(timeoutSeconds)
     check not client.disabled          ## the stub IS a credentialed transport
     var game = bench()
@@ -353,14 +379,26 @@ suite "a stubbed transport fails explicitly with classified causes":
       connected[slot] = true
     client.decideAll(game, prompts, scripts, connected, PromptSelection())
 
-  test "junk with no JSON object fails as model_invalid":
+  test "junk with no JSON object fails as model_invalid without retrying":
     let res = runAgainstStub(smJunk)
     check not res.ok
+    check stubRequests == Seats
     check res.failures.len == Seats
     for i, failure in res.failures:
       check failure.slot == i
       check failure.kind == dfkModelInvalid
       check failure.cause == "model_invalid_action"
+      check not res.decided[i]
+
+  test "a 503 fails as infrastructure provider_http_error without retrying":
+    let res = runAgainstStub(smUnavailable)
+    check not res.ok
+    check stubRequests == Seats
+    check res.failures.len == Seats
+    for i, failure in res.failures:
+      check failure.slot == i
+      check failure.kind == dfkInfrastructure
+      check failure.cause == "provider_http_error"
       check not res.decided[i]
 
   test "a malformed non-JSON HTTP 200 envelope fails as infrastructure provider_invalid_response":

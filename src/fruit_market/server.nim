@@ -127,6 +127,7 @@ proc sendPlayerStates(gs: GameState) =
 proc finishEpisode(runtimeConfig: RuntimeConfig) =
   var
     results: JsonNode
+    playerFailure: JsonNode
     replayData: string
     grace = 20
     failed = false
@@ -137,6 +138,8 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
     grace = state.config.shutdownGraceSeconds
     failed = state.sim.failed
     results = if failed: state.sim.failureJson() else: state.sim.resultsJson()
+    if failed:
+      playerFailure = state.sim.playerFailureJson()
     replayData = $replayJson(state.sim, results)
     ## Send final frames to players BEFORE writing artifacts: the hosted
     ## worker tears player pods down as soon as results.json exists.
@@ -167,7 +170,7 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   if failed:
     echo "fruit-market: episode failed (", results["failure_category"].getStr(),
       " / ", results["failure_cause"].getStr(), "); omitting numeric results"
-    writeArtifact(getEnv("COGAME_PLAYER_FAILURE_URI").strip(), $results,
+    writeArtifact(getEnv("COGAME_PLAYER_FAILURE_URI").strip(), $playerFailure,
       "application/json", "COGAME_PLAYER_FAILURE_METHOD")
     writeArtifact(runtimeConfig.replayUri, replayData, "application/json",
       "COGAME_SAVE_REPLAY_METHOD")
@@ -342,9 +345,11 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             if item.kind == dfkInfrastructure:
               primary = item
               break
-          var failedSeats: seq[int]
+          var failedSeats: seq[int] = @[primary.slot]
           for item in failures:
-            failedSeats.add(item.slot)
+            if item.slot != primary.slot:
+              failedSeats.add(item.slot)
+          for item in failures:
             if state.capture != nil:
               if external[item.slot]:
                 for idx, errMsg in state.externalErrors[item.slot]:

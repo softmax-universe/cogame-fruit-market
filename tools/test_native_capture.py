@@ -187,7 +187,6 @@ def _malformed_fruit_reply(slot: int, content: str) -> bytes:
     m_round = re.search(r"^ROUND (\d+) of (\d+)", content)
     assert m_round is not None, content[:120]
     round_no = int(m_round.group(1))
-    is_retry = "Your previous reply was invalid." in content
     farm = "apple" if "apple farmer" in content else "banana"
 
     def wrap(order_obj: object) -> bytes:
@@ -199,78 +198,8 @@ def _malformed_fruit_reply(slot: int, content: str) -> bytes:
             }
         ).encode()
 
-    if round_no == 1:
-        return wrap({"job": "harvest", "eat": "any", "say": "r1", "notes": "stock"})
-    if round_no == 2:
-        if slot == 0:
-            if not is_retry:
-                return wrap(
-                    {
-                        "job": "market",
-                        "stall": "north",
-                        "eat": "crave",
-                        "offer": {"give": {"n": 3}, "want": {"fruit": "banana", "n": 2}},
-                    }
-                )
-            return wrap(
-                {
-                    "job": "market",
-                    "stall": "north",
-                    "eat": "crave",
-                    "offer": _market_offer_for_farm(farm),
-                    "say": "retry-ok",
-                    "notes": "recovered",
-                }
-            )
-        if not is_retry:
-            return wrap(
-                {
-                    "job": "market",
-                    "stall": "north",
-                    "eat": "crave",
-                    "offer": {"give": {"fruit": "apple", "n": 3}, "want": {"n": 2}},
-                }
-            )
-        return wrap(
-            {
-                "job": "market",
-                "stall": "north",
-                "eat": "crave",
-                "offer": _market_offer_for_farm(farm),
-                "say": "retry-ok-1",
-                "notes": "recovered",
-            }
-        )
-    if round_no == 3:
-        if slot == 0:
-            if not is_retry:
-                return wrap(
-                    {
-                        "job": "market",
-                        "stall": "east",
-                        "eat": "crave",
-                        "offer": {"give": {"fruit": "apple"}, "want": {"fruit": "banana", "n": 2}},
-                    }
-                )
-            return wrap({"job": "harvest", "eat": "any", "say": "r3-ok", "notes": "recovered"})
-        if not is_retry:
-            return wrap(
-                {
-                    "job": "market",
-                    "stall": "east",
-                    "eat": "crave",
-                    "offer": {
-                        "give": {"fruit": ["apple"], "n": 3},
-                        "want": {"fruit": "banana", "n": 2},
-                    },
-                }
-            )
-        return wrap({"job": "harvest", "eat": "any", "say": "r3-ok-1", "notes": "recovered"})
     if round_no == 4:
         if slot == 0:
-            if not is_retry:
-                # 200 JSON object without a "content" array
-                return b"{}"
             return wrap(
                 {
                     "job": "harvest",
@@ -289,18 +218,6 @@ def _malformed_fruit_reply(slot: int, content: str) -> bytes:
                 "notes": "null-fruit",
             }
         )
-    if round_no == 5 and slot == 0:
-        if not is_retry:
-            # 159 ASCII bytes + 3-byte em-dash crossing byte 160 without braces
-            return json.dumps(
-                {
-                    "model": "loopback-fixture",
-                    "stop_reason": "end_turn",
-                    "content": [{"type": "text", "text": ("x" * 159) + "— multibyte prose without braces"}],
-                },
-                ensure_ascii=False,
-            ).encode("utf-8")
-        return wrap({"job": "harvest", "eat": "any", "say": "utf8-ok", "notes": "ok"})
     if round_no == 5 and slot == 1:
         fenced = "```json\n" + json.dumps({"job": "harvest", "eat": "any", "say": "fenced-ok", "notes": "ok"}) + "\n```"
         return json.dumps(
@@ -310,16 +227,6 @@ def _malformed_fruit_reply(slot: int, content: str) -> bytes:
                 "content": [{"type": "text", "text": fenced}],
             }
         ).encode()
-    if round_no == 6 and slot == 0:
-        if not is_retry:
-            return json.dumps(
-                {
-                    "model": "loopback-fixture",
-                    "stop_reason": "end_turn",
-                    "content": [{"type": "text", "text": 'Sure! {"job": "harvest", "eat": "any"}'}],
-                }
-            ).encode()
-        return wrap({"job": "harvest", "eat": "any", "say": "prose-retry-ok", "notes": "ok"})
     if round_no % 2 == 1:
         return wrap({"job": "harvest", "eat": "any", "say": f"r{round_no}", "notes": "ok"})
     return wrap(
@@ -347,6 +254,7 @@ def main() -> None:
             "mixed-invalid",
             "ambiguous",
             "429",
+            "503",
             "no-credentials",
             "external-timeout",
             "normalized",
@@ -413,9 +321,11 @@ def main() -> None:
                             "content": [{"type": "text", "text": text}],
                         }
                     ).encode()
-                    status = 429 if args.mode == "429" else 200
+                    status = 429 if args.mode == "429" else (503 if args.mode == "503" else 200)
                     if status == 429:
                         body = b'{"error":{"type":"rate_limit_error","message":"local fixture"}}'
+                    elif status == 503:
+                        body = b'{"error":{"type":"service_unavailable","message":"local fixture"}}'
                 calls.append(
                     {
                         "id": call_id,
@@ -521,7 +431,7 @@ def main() -> None:
                     stderr=subprocess.STDOUT,
                 )
             )
-        expect_failure = args.mode in ("invalid", "mixed-invalid", "ambiguous", "429", "no-credentials", "external-timeout")
+        expect_failure = args.mode in ("invalid", "mixed-invalid", "ambiguous", "429", "503", "no-credentials", "external-timeout")
         game_rc = game.wait(timeout=60)
         if expect_failure:
             assert game_rc != 0, f"expected non-zero exit for mode={args.mode}, got {game_rc}"
@@ -547,26 +457,37 @@ def main() -> None:
     if expect_failure:
         assert not (output / "results.json").exists(), "failed episode must not emit numeric results.json"
         failure = json.loads((output / "player_failure.json").read_text())
-        assert failure["reason"] == "failed", failure
-        assert "scores" not in failure and "win" not in failure, failure
+        assert set(failure.keys()) == {"failed_policy_index", "message", "kind"}, failure
+        assert isinstance(failure["failed_policy_index"], int) and failure["failed_policy_index"] >= 0, failure
+        assert isinstance(failure["message"], str) and 1 <= len(failure["message"]) <= 2000, failure
         if args.mode in ("invalid", "mixed-invalid", "ambiguous"):
-            assert failure["failure_category"] == "model_invalid", failure
-            assert failure["failure_cause"] == "model_invalid_action", failure
+            assert failure["kind"] == "player_error", failure
+            assert failure["failed_policy_index"] == 0, failure
+            assert "model_invalid_action" in failure["message"], failure
             expected_action_status = "rejected"
-            expected_calls = 4
+            expected_calls = 2
         elif args.mode == "429":
-            assert failure["failure_category"] == "infrastructure", failure
-            assert failure["failure_cause"] == "provider_rate_limit", failure
+            assert failure["kind"] == "episode_inconclusive", failure
+            assert failure["failed_policy_index"] == 0, failure
+            assert "provider_rate_limit" in failure["message"], failure
             expected_action_status = "missing"
-            expected_calls = 4
+            expected_calls = 2
+        elif args.mode == "503":
+            assert failure["kind"] == "episode_inconclusive", failure
+            assert failure["failed_policy_index"] == 0, failure
+            assert "provider_http_error" in failure["message"], failure
+            expected_action_status = "missing"
+            expected_calls = 2
         elif args.mode == "no-credentials":
-            assert failure["failure_category"] == "infrastructure", failure
-            assert failure["failure_cause"] == "missing_credentials", failure
+            assert failure["kind"] == "episode_inconclusive", failure
+            assert failure["failed_policy_index"] == 0, failure
+            assert "missing_credentials" in failure["message"], failure
             expected_action_status = "missing"
             expected_calls = 0
         elif args.mode == "external-timeout":
-            assert failure["failure_category"] == "infrastructure", failure
-            assert failure["failure_cause"] == "external_timeout", failure
+            assert failure["kind"] == "episode_inconclusive", failure
+            assert failure["failed_policy_index"] == 2, failure
+            assert "external_timeout" in failure["message"], failure
             expected_action_status = "missing"
             expected_calls = 2
         assert len(calls) == expected_calls, (len(calls), expected_calls)
@@ -588,8 +509,8 @@ def main() -> None:
                 {
                     "mode": args.mode,
                     "failed": True,
-                    "failure_category": failure["failure_category"],
-                    "failure_cause": failure["failure_cause"],
+                    "kind": failure["kind"],
+                    "failed_policy_index": failure["failed_policy_index"],
                     "fixture_calls": len(calls),
                     "fixture_only": True,
                 }
@@ -618,7 +539,7 @@ def main() -> None:
     decisions = events[:-1]
     assert len(decisions) == 96
     actual = [a for d in decisions for a in d["attempts"] if a["origin"] == "model"]
-    expected_calls = 31 if args.mode == "malformed-fruit" else 24
+    expected_calls = 24
     assert len(actual) == len(calls) == expected_calls, (len(actual), len(calls), expected_calls)
     received = {c["id"]: c for c in calls}
     for attempt in actual:
@@ -634,52 +555,21 @@ def main() -> None:
         }, external_summary
         assert results["total_trades"] > 0, results
         by_round_seat = {(int(d["observation"]["round"]), int(d["seat"])): d for d in decisions}
-        # Round 2 seat 0: attempt 0 missing offer.give.fruit -> recovered on retry attempt 1
-        r2s0 = by_round_seat[(2, 0)]
-        assert r2s0["action_status"] == "accepted"
-        assert r2s0["selected_attempt_id"].endswith("-1")
-        assert "missing fruit in offer.give.fruit" in r2s0["attempts"][0]["rejection_reason"]
-        # Round 2 seat 1: missing offer.want.fruit -> recovered on retry attempt 1
-        r2s1 = by_round_seat[(2, 1)]
-        assert r2s1["action_status"] == "accepted"
-        assert r2s1["selected_attempt_id"].endswith("-1")
-        assert "missing fruit in offer.want.fruit" in r2s1["attempts"][0]["rejection_reason"]
-        # Round 3 seat 0: missing offer.give.n -> recovered on retry attempt 1
-        r3s0 = by_round_seat[(3, 0)]
-        assert r3s0["action_status"] == "accepted"
-        assert r3s0["selected_attempt_id"].endswith("-1")
-        assert "missing offer.give.n" in r3s0["attempts"][0]["rejection_reason"]
-        # Round 3 seat 1: non-string offer.give.fruit -> recovered on retry attempt 1
-        r3s1 = by_round_seat[(3, 1)]
-        assert r3s1["action_status"] == "accepted"
-        assert r3s1["selected_attempt_id"].endswith("-1")
-        assert "unknown fruit in offer.give.fruit:" in r3s1["attempts"][0]["rejection_reason"]
-        # Round 4 seat 0: empty 200 envelope {} -> recovered on retry with legal null offer withdrawal
+        # Round 4 seat 0: legal null offer withdrawal
         r4s0 = by_round_seat[(4, 0)]
         assert r4s0["action_status"] == "accepted"
-        assert r4s0["selected_attempt_id"].endswith("-1")
-        assert "no JSON object in response" in r4s0["attempts"][0]["rejection_reason"]
+        assert r4s0["selected_attempt_id"].endswith("-0")
         assert r4s0["executed_action"]["offer"] is None
         # Round 4 seat 1: optional top-level "fruit": null normalized cleanly without failing gameplay
         r4s1 = by_round_seat[(4, 1)]
         assert r4s1["action_status"] == "rejected"
         assert r4s1["selected_attempt_id"] is None
         assert "fruit" not in r4s1["executed_action"]
-        # Round 5 seat 0: multibyte UTF-8 crossing byte 160 rejected cleanly with valid UTF-8 trajectory
-        r5s0 = by_round_seat[(5, 0)]
-        assert r5s0["action_status"] == "accepted"
-        assert r5s0["selected_attempt_id"].endswith("-1")
-        assert "no JSON object in response:" in r5s0["attempts"][0]["rejection_reason"]
         # Round 5 seat 1: single JSON-tagged Markdown code fence accepted cleanly
         r5s1 = by_round_seat[(5, 1)]
         assert r5s1["action_status"] == "accepted"
         assert r5s1["selected_attempt_id"].endswith("-0")
         assert r5s1["executed_action"]["say"] == "fenced-ok"
-        # Round 6 seat 0: prose-wrapped JSON rejected on attempt 0 -> recovered on retry attempt 1
-        r6s0 = by_round_seat[(6, 0)]
-        assert r6s0["action_status"] == "accepted"
-        assert r6s0["selected_attempt_id"].endswith("-1")
-        assert r6s0["executed_action"]["say"] == "prose-retry-ok"
         # Seat 2 (external player): all 12 rounds accepted valid external orders after rejecting malformed frames
         for r in range(1, 13):
             d_ext = by_round_seat[(r, 2)]

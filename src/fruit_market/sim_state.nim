@@ -168,6 +168,32 @@ proc echoLog*(sim: Sim, parts: varargs[string, `$`]) =
     line.add(part)
   echo line
 
+proc playerFailureJson*(sim: Sim): JsonNode =
+  ## Coworld's closed GamePlayerFailure record written to
+  ## COGAME_PLAYER_FAILURE_URI. Only `failed_policy_index`, `message`, and
+  ## `kind` are permitted.
+  if sim.failedSeats.len == 0 or sim.failedSeats[0] < 0:
+    raise newException(FruitMarketError,
+      "failed episode has no failing seat index")
+  let kind =
+    if sim.failureCategory == "model_invalid": "player_error"
+    else: "episode_inconclusive"
+  let cause = sim.failureCause.strip()
+  let detail = sim.failureDetail.strip()
+  let rawMessage =
+    if cause.len > 0 and detail.len > 0: cause & ": " & detail
+    elif detail.len > 0: detail
+    elif cause.len > 0: cause
+    else: "episode failed"
+  var message = cleanText(rawMessage, 2000)
+  if message.len == 0:
+    message = "episode failed"
+  %*{
+    "failed_policy_index": sim.failedSeats[0],
+    "message": message,
+    "kind": kind
+  }
+
 proc failureJson*(sim: Sim): JsonNode =
   ## Unscored terminal failure record: no authoritative gameplay scores or
   ## winners are emitted when an unfinished episode fails.
