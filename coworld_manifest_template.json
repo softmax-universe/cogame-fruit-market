@@ -266,7 +266,7 @@
           "default": 18
         },
         "maxOutputTokens": {
-          "description": "Model output budget. Below ~1000 a truncated reply shows up as the misleading 'unbalanced JSON object' signature.",
+          "description": "Maximum number of output tokens requested per model response.",
           "type": "integer",
           "minimum": 200,
           "maximum": 2000,
