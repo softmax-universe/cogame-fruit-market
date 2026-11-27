@@ -179,7 +179,7 @@ jobs:
           nim c -d:release --path:src -o:"${RUNNER_TEMP}/fruit-market" src/fruit_market.nim
           nim c -d:release --path:src -o:"${RUNNER_TEMP}/fruit-market-player" src/fruit_market_player.nim
           nim c -d:release --path:src -o:"${RUNNER_TEMP}/fruit-market-verify" tools/verify_native_capture.nim
-          python3 tools/test_native_capture.py "${RUNNER_TEMP}/fruit-market" "${RUNNER_TEMP}/fruit-market-player" "${RUNNER_TEMP}/native-accepted" --mode accepted
+          python3 tools/test_native_capture.py "${RUNNER_TEMP}/fruit-market" "${RUNNER_TEMP}/fruit-market-player" "${RUNNER_TEMP}/native-accepted" --mode accepted --max-output-tokens 731
           "${RUNNER_TEMP}/fruit-market-verify" "${RUNNER_TEMP}/native-accepted/config.json" "${RUNNER_TEMP}/native-accepted/trajectory.jsonl"
           python3 tools/test_native_capture.py "${RUNNER_TEMP}/fruit-market" "${RUNNER_TEMP}/fruit-market-player" "${RUNNER_TEMP}/native-malformed-fruit" --mode malformed-fruit
           "${RUNNER_TEMP}/fruit-market-verify" "${RUNNER_TEMP}/native-malformed-fruit/config.json" "${RUNNER_TEMP}/native-malformed-fruit/trajectory.jsonl"

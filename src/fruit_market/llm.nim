@@ -109,7 +109,7 @@ proc bedrockUrl(client: LlmClient): string =
 proc newLlmClient*(config: GameConfig): LlmClient =
   result = LlmClient(
     model: config.model,
-    maxOutputTokens: max(1000, config.maxOutputTokens),
+    maxOutputTokens: config.maxOutputTokens,
     timeoutSeconds: max(1, config.llmTimeoutSeconds)
   )
   let sidecarEndpoint = getEnv("COWORLD_LLM_ENDPOINT").strip()

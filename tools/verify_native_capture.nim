@@ -54,7 +54,7 @@ while not game.done:
         let request = attempt["request"]
         doAssert request["system"].getStr() == system
         doAssert request["messages"] == %*[{"role": "user", "content": user}]
-        doAssert request["max_tokens"].getInt() == max(1000, config.maxOutputTokens)
+        doAssert request["max_tokens"].getInt() == config.maxOutputTokens
         doAssert attempt["prompt"] == %*[
           {"role": "system", "content": system}, {"role": "user", "content": user}]
         source = if retried: osRetry else: osLlm

@@ -262,6 +262,7 @@ def main() -> None:
         ),
         default="accepted",
     )
+    parser.add_argument("--max-output-tokens", type=int)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--no-capture", action="store_true")
     parser.add_argument("--source-revision", default="loopback-working-tree-not-a-published-source")
@@ -362,6 +363,8 @@ def main() -> None:
         "playerConnectTimeoutSeconds": 10,
         "shutdownGraceSeconds": 0,
     }
+    if args.max_output_tokens is not None:
+        config["maxOutputTokens"] = args.max_output_tokens
     (output / "config.json").write_text(json.dumps(config))
     # Construct a clean environment: credentials and inherited remote endpoints never reach fixtures.
     env = {k: os.environ[k] for k in ("PATH", "HOME", "TMPDIR") if k in os.environ}
@@ -452,6 +455,8 @@ def main() -> None:
         fixture.shutdown()
         fixture.server_close()
         (output / "fixture-calls.json").write_text(json.dumps(calls, indent=2) + "\n")
+    for call in calls:
+        assert call["request"]["max_tokens"] == config.get("maxOutputTokens", 1000)
     assert canary not in (output / "replay.json").read_text()
     trajectory = output / "trajectory.jsonl"
     if expect_failure:
